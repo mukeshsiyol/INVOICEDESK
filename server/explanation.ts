@@ -167,7 +167,7 @@ function deterministicFallback(input: ExplanationInput, reason: string): Explana
 }
 
 function isTransient(err: unknown): boolean {
-  return /\b(429|500|502|503|504)\b|UNAVAILABLE|DEADLINE_EXCEEDED|RESOURCE_EXHAUSTED|overloaded|timed? ?out|timeout|ECONNRESET|ETIMEDOUT/i.test(
+  return /\b(429|500|502|503|504)\b|UNAVAILABLE|DEADLINE_EXCEEDED|RESOURCE_EXHAUSTED|overloaded|timed? ?out|timeout|abort(?:ed|error)?|ECONNRESET|ETIMEDOUT/i.test(
     err instanceof Error ? `${err.name} ${err.message}` : String(err)
   );
 }
@@ -195,7 +195,6 @@ export async function generateDecisionExplanation(input: ExplanationInput): Prom
       invoice: input.invoice,
       deterministic_checks: deterministicChecks(input),
       triggered_rules: input.triggeredRules,
-      evidence_snapshot: input.evidenceSnapshot,
     };
     let response: any;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -216,7 +215,7 @@ export async function generateDecisionExplanation(input: ExplanationInput): Prom
               },
               required: ['decision_outcome', 'executive_summary', 'decision_explanation', 'recommended_actions'],
             } as any,
-            abortSignal: AbortSignal.timeout(attempt === 0 ? 12_000 : 15_000),
+            abortSignal: AbortSignal.timeout(attempt === 0 ? 20_000 : 22_000),
           },
         });
         break;
