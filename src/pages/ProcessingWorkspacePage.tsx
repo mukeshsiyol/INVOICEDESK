@@ -541,7 +541,7 @@ export function ProcessingWorkspacePage() {
                 </span>
               </div>
               <p className="text-sm text-slate-800 dark:text-slate-200 mt-2 leading-relaxed">
-                {decision.explanation}
+                {decision.explanation_details?.executive_summary || decision.explanation}
               </p>
 
               {decision.evidence_snapshot?.ai_reviewer_brief && (
@@ -572,6 +572,47 @@ export function ProcessingWorkspacePage() {
                     </ul>
                   )}
                 </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 dark:border-slate-700/80 pt-2 text-[11px]">
+                <span className={`inline-flex items-center rounded-full border px-2 py-1 font-medium ${
+                  decision.explanation_source === 'GEMINI'
+                    ? 'border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-200'
+                    : 'border-slate-200 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                }`}>
+                  {decision.explanation_source === 'GEMINI'
+                    ? 'AI-generated explanation · Based on system validation results'
+                    : 'Deterministic fallback explanation'}
+                </span>
+                <span className="text-slate-500 dark:text-slate-400">
+                  {decision.explanation_model || decision.explanation_provider || 'deterministic'}
+                  {' · '}{decision.explanation_status || 'FALLBACK'}
+                </span>
+              </div>
+
+              {decision.explanation_details?.decision_explanation &&
+                decision.explanation_details.decision_explanation !== decision.explanation_details.executive_summary && (
+                  <p className="text-xs text-slate-600 dark:text-slate-300 mt-2 leading-relaxed">
+                    {decision.explanation_details.decision_explanation}
+                  </p>
+                )}
+
+              {decision.explanation_details?.financial_impact && (
+                <p className="text-xs text-slate-600 dark:text-slate-300 mt-2">
+                  <strong>Financial impact:</strong> {decision.explanation_details.financial_impact}
+                </p>
+              )}
+
+              {decision.explanation_details?.recommended_actions?.length > 0 && (
+                <div className="mt-2 text-xs text-slate-600 dark:text-slate-300">
+                  <strong>Recommended next step:</strong> {decision.explanation_details.recommended_actions.join(' ')}
+                </div>
+              )}
+
+              {decision.explanation_source === 'DETERMINISTIC_FALLBACK' && decision.explanation_fallback_reason && (
+                <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-300">
+                  Gemini explanation unavailable: {decision.explanation_fallback_reason}
+                </p>
               )}
 
               {/* Preserved Original Decision + Human Override */}

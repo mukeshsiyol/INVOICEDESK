@@ -277,6 +277,8 @@ async function ingestBufferAndQueueRun(params: {
   original_filename: string;
   file_sha256: string;
   processing_status: string;
+  error_stage: number | null;
+  error_message: string | null;
 }> {
   const db = getDb();
   const invoiceId = crypto.randomUUID();
@@ -340,12 +342,18 @@ async function ingestBufferAndQueueRun(params: {
     }
   }
 
+  const persistedRun = db
+    .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
+    .get(runId) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
+
   return {
     invoice_id: invoiceId,
     run_id: runId,
     original_filename: safeDisplayFilename,
     file_sha256: sha256,
-    processing_status: 'QUEUED',
+    processing_status: persistedRun?.status || 'QUEUED',
+    error_stage: persistedRun?.error_stage ?? null,
+    error_message: persistedRun?.error_message ?? null,
   };
 }
 
@@ -1107,6 +1115,13 @@ export function createApiRouter(): express.Router {
           ...decisionRow,
           triggered_rules: JSON.parse(decisionRow.triggered_rules || '[]'),
           evidence_snapshot: JSON.parse(decisionRow.evidence_snapshot || '{}'),
+          explanation_details: (() => {
+            try {
+              return JSON.parse(decisionRow.explanation_json || '{}');
+            } catch {
+              return {};
+            }
+          })(),
         }
       : null;
 
@@ -1236,11 +1251,17 @@ export function createApiRouter(): express.Router {
     if (config.isServerless) {
       await p;
     }
+    const finishedRun = db
+      .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
+      .get(run.id) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
     res.status(202).json({
       invoice_id: inv.id,
       run_id: run.id,
       run_number: run.run_number,
-      processing_status: 'QUEUED',
+      processing_status: finishedRun?.status || 'QUEUED',
+      run_status: finishedRun?.status || 'QUEUED',
+      error_stage: finishedRun?.error_stage ?? null,
+      error_message: finishedRun?.error_message ?? null,
     });
   });
 
@@ -1296,11 +1317,17 @@ export function createApiRouter(): express.Router {
     if (config.isServerless) {
       await p;
     }
+    const finishedRun = db
+      .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
+      .get(newRunId) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
     res.status(202).json({
       invoice_id: inv.id,
       run_id: newRunId,
       run_number: nextRunNumber,
-      processing_status: 'QUEUED',
+      processing_status: finishedRun?.status || 'QUEUED',
+      run_status: finishedRun?.status || 'QUEUED',
+      error_stage: finishedRun?.error_stage ?? null,
+      error_message: finishedRun?.error_message ?? null,
     });
   });
 
@@ -1479,6 +1506,8 @@ export function createApiRouter(): express.Router {
         `SELECT i.*, COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
                 po.po_number AS matched_po_number, po.original_amount AS po_original_amount, po.consumed_amount AS po_consumed_amount,
                 d.outcome AS original_decision, d.primary_reason_code, d.triggered_rules, d.explanation,
+                d.explanation_source, d.explanation_provider, d.explanation_model, d.explanation_status,
+                d.explanation_fallback_reason, d.explanation_json,
                 u.full_name AS assigned_reviewer_name
          FROM invoices i
          LEFT JOIN vendors v ON v.id = i.vendor_id
@@ -1494,6 +1523,13 @@ export function createApiRouter(): express.Router {
       .map((r) => ({
         ...r,
         triggered_rules: r.triggered_rules ? JSON.parse(r.triggered_rules) : [],
+        explanation_details: (() => {
+          try {
+            return JSON.parse(r.explanation_json || '{}');
+          } catch {
+            return {};
+          }
+        })(),
       }))
       .filter((r) => {
         if (category === 'ALL') return true;

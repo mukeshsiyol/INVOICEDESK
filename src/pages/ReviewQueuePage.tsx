@@ -201,7 +201,19 @@ export function ReviewQueuePage() {
               <div className="font-mono font-semibold text-amber-800 dark:text-amber-300">
                 {selected.primary_reason_code}
               </div>
-              <p className="text-slate-700 dark:text-slate-200 leading-relaxed">{selected.explanation}</p>
+              <p className="text-slate-700 dark:text-slate-200 leading-relaxed">
+                {selected.explanation_details?.executive_summary || selected.explanation}
+              </p>
+              <div className="text-[10px] font-medium text-slate-600 dark:text-slate-300">
+                {selected.explanation_source === 'GEMINI'
+                  ? `AI-generated · Based on system validation results · ${selected.explanation_model || 'Google Gemini'}`
+                  : `Deterministic fallback${selected.explanation_fallback_reason ? ` · ${selected.explanation_fallback_reason}` : ''}`}
+              </div>
+              {selected.explanation_details?.recommended_actions?.length > 0 && (
+                <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+                  <strong>Suggested next step:</strong> {selected.explanation_details.recommended_actions.join(' ')}
+                </p>
+              )}
             </div>
 
             {selected.matched_po_number && (

@@ -4,6 +4,7 @@ import Decimal from 'decimal.js';
 import { writeAuditLog } from './auth.ts';
 import { config } from './config.ts';
 import { getDb, isoNow } from './db.ts';
+import { fallbackDecisionExplanation, generateDecisionExplanation, type ExplanationInput } from './explanation.ts';
 import {
   normalizeDocNumber,
   parseDecimalSafe,
@@ -518,6 +519,28 @@ export async function executeProcessingRun(runId: string): Promise<void> {
             candidatePos: poMatch.candidatePos || [],
           });
 
+    const explanationInput: ExplanationInput = {
+      outcome: decisionResult.outcome,
+      primaryReasonCode: decisionResult.primaryReasonCode,
+      triggeredRules: decisionResult.triggeredRules,
+      evidenceSnapshot: {
+        ...decisionResult.evidenceSnapshot,
+        ...(aiReviewerBrief ? { ai_reviewer_brief: aiReviewerBrief } : {}),
+      } as unknown as Record<string, unknown>,
+      invoice: {
+        filename: invoiceRow.original_filename,
+        vendor: extracted.vendor.name,
+        invoiceNumber: extracted.invoice_number,
+        currency: extracted.currency,
+        subtotal: extracted.subtotal,
+        tax: extracted.tax_amount,
+        total: extracted.total_amount,
+        purchaseOrder: extracted.po_number,
+      },
+    };
+    // Gemini explains the fixed result; only the deterministic engine sets the outcome.
+    let explanation = await generateDecisionExplanation(explanationInput);
+
     const decisionId = crypto.randomUUID();
     const completedAt = isoNow();
     const totalDurationMs = Date.now() - runStartMs;
@@ -528,7 +551,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       // Re-verify PO balance under exclusive write lock if auto-approving
       let finalOutcome = decisionResult.outcome;
       let finalReasonCode = decisionResult.primaryReasonCode;
-      let finalExplanation = decisionResult.explanation;
+      let finalExplanation = explanation.decision_explanation;
       let finalReviewStatus = reviewStatus;
       let finalTriggered = decisionResult.triggeredRules;
 
@@ -576,6 +599,25 @@ export async function executeProcessingRun(runId: string): Promise<void> {
               evidence: { rem_before: remBefore.toFixed(2), overrun: overrun.toFixed(2) },
             },
           ];
+          explanation = fallbackDecisionExplanation(
+            {
+              ...explanationInput,
+              outcome: finalOutcome,
+              primaryReasonCode: finalReasonCode,
+              triggeredRules: finalTriggered,
+              evidenceSnapshot: {
+                ...explanationInput.evidenceSnapshot,
+                tolerance: {
+                  ...tolerance,
+                  remainingBefore: remBefore.toFixed(2),
+                  overrunAmount: overrun.toFixed(2),
+                  withinTolerance: false,
+                },
+              },
+            },
+            'Concurrent PO balance changed during processing; explanation was generated deterministically from the final locked result.'
+          );
+          explanation.decision_explanation = finalExplanation;
         } else {
           const newConsumed = consumed.plus(totalDec);
           const newStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
@@ -592,8 +634,12 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       };
 
       db.prepare(
-        `INSERT INTO decisions (id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO decisions (
+          id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
+          explanation_source, explanation_provider, explanation_model, explanation_prompt_version, explanation_status,
+          explanation_generated_at, explanation_input_tokens, explanation_output_tokens, explanation_fallback_reason,
+          explanation_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         decisionId,
         runId,
@@ -603,6 +649,16 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         JSON.stringify(finalTriggered),
         finalExplanation,
         JSON.stringify(fullEvidenceSnapshot),
+        explanation.explanation_source,
+        explanation.explanation_provider,
+        explanation.explanation_model,
+        explanation.prompt_version,
+        explanation.generation_status,
+        explanation.generated_at,
+        explanation.token_usage.input,
+        explanation.token_usage.output,
+        explanation.fallback_reason,
+        JSON.stringify(explanation),
         completedAt
       );
 
@@ -640,6 +696,9 @@ export async function executeProcessingRun(runId: string): Promise<void> {
           run_number: runRow.run_number,
           primary_reason_code: finalReasonCode,
           explanation: finalExplanation,
+          explanation_source: explanation.explanation_source,
+          explanation_model: explanation.explanation_model,
+          explanation_status: explanation.generation_status,
         },
       });
 
@@ -674,11 +733,17 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         stageNumber: 8,
         status: 'COMPLETED',
         durationMs: Date.now() - s8Start,
-        summary: `Final Decision: ${finalOutcome} (${finalReasonCode})`,
+        summary: `Final Decision: ${finalOutcome} (${finalReasonCode}) · Explanation ${explanation.explanation_source}`,
         evidence: {
           outcome: finalOutcome,
           primary_reason_code: finalReasonCode,
           triggered_rules: finalTriggered,
+          explanation_source: explanation.explanation_source,
+          explanation_provider: explanation.explanation_provider,
+          explanation_model: explanation.explanation_model,
+          explanation_status: explanation.generation_status,
+          explanation_fallback_reason: explanation.fallback_reason,
+          token_usage: explanation.token_usage,
         },
       });
 

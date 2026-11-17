@@ -170,6 +170,16 @@ function initSchema(db: DatabaseSync): void {
       triggered_rules TEXT NOT NULL,
       explanation TEXT NOT NULL,
       evidence_snapshot TEXT NOT NULL,
+      explanation_source TEXT NOT NULL DEFAULT 'DETERMINISTIC_FALLBACK',
+      explanation_provider TEXT NOT NULL DEFAULT 'deterministic',
+      explanation_model TEXT,
+      explanation_prompt_version TEXT NOT NULL DEFAULT 'invoice-explanation-v1',
+      explanation_status TEXT NOT NULL DEFAULT 'FALLBACK',
+      explanation_generated_at TEXT,
+      explanation_input_tokens INTEGER,
+      explanation_output_tokens INTEGER,
+      explanation_fallback_reason TEXT,
+      explanation_json TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_decisions_invoice ON decisions(invoice_id, created_at DESC);
@@ -269,6 +279,28 @@ function initSchema(db: DatabaseSync): void {
          END
      WHERE id = 1`
   ).run(DEFAULT_REJECTION_SUBJECT_TEMPLATE, DEFAULT_REJECTION_BODY_TEMPLATE);
+
+  // Additive migration for databases created before explanation provenance existed.
+  const decisionColumns = new Set(
+    (db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map((column) => column.name)
+  );
+  const explanationColumns: Array<[string, string]> = [
+    ['explanation_source', "TEXT NOT NULL DEFAULT 'DETERMINISTIC_FALLBACK'"],
+    ['explanation_provider', "TEXT NOT NULL DEFAULT 'deterministic'"],
+    ['explanation_model', 'TEXT'],
+    ['explanation_prompt_version', "TEXT NOT NULL DEFAULT 'invoice-explanation-v1'"],
+    ['explanation_status', "TEXT NOT NULL DEFAULT 'FALLBACK'"],
+    ['explanation_generated_at', 'TEXT'],
+    ['explanation_input_tokens', 'INTEGER'],
+    ['explanation_output_tokens', 'INTEGER'],
+    ['explanation_fallback_reason', 'TEXT'],
+    ['explanation_json', "TEXT NOT NULL DEFAULT '{}'"],
+  ];
+  for (const [column, definition] of explanationColumns) {
+    if (!decisionColumns.has(column)) {
+      db.exec(`ALTER TABLE decisions ADD COLUMN ${column} ${definition}`);
+    }
+  }
 }
 
 export function isoNow(): string {
