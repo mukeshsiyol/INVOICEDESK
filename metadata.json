@@ -1,0 +1,6 @@
+{
+  "name": "InvoiceDesk",
+  "description": "AI-powered Accounts Payable automation platform that transforms unstructured vendor invoice PDFs into verified, explainable financial decisions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
