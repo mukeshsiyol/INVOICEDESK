@@ -14,6 +14,7 @@ async function bootstrap() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    app.use(express.static(path.resolve(process.cwd(), 'public')));
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

@@ -96,7 +96,10 @@ export function validatePdfBuffer(buffer: Buffer): { valid: boolean; reason?: st
 }
 
 export async function inspectPdfNativeText(pdfBuffer: Buffer): Promise<NativePdfInspection> {
-  // Dynamically import pdfjs-dist legacy build for clean Node execution
+  // Preload the worker module onto globalThis.pdfjsWorker so serverless bundlers
+  // (e.g. Vercel /var/task) trace pdf.worker.mjs statically and pdf.mjs skips dynamic import.
+  const pdfjsWorker = await import('pdfjs-dist/legacy/build/pdf.worker.mjs');
+  (globalThis as Record<string, unknown>).pdfjsWorker = pdfjsWorker;
   const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
@@ -253,10 +256,10 @@ const extractionResponseSchema = {
   ],
 };
 
-function isTransientCapacityError(err: unknown): boolean {
+function isFallbackEligibleError(err: unknown): boolean {
   const name = err instanceof Error ? err.name : '';
   const msg = err instanceof Error ? err.message : String(err);
-  return /\b(429|503|504)\b|UNAVAILABLE|DEADLINE_EXCEEDED|RESOURCE_EXHAUSTED|high demand|overloaded|try again later|AbortError|TimeoutError|aborted|timed out|timeout|ECONNRESET|ETIMEDOUT|fetch failed/i.test(
+  return /\b(404|429|503|504)\b|NOT_FOUND|not found for API version|UNAVAILABLE|DEADLINE_EXCEEDED|RESOURCE_EXHAUSTED|high demand|overloaded|try again later|AbortError|TimeoutError|aborted|timed out|timeout|ECONNRESET|ETIMEDOUT|fetch failed/i.test(
     `${name} ${msg}`
   );
 }
@@ -325,10 +328,9 @@ export class GeminiExtractionProvider implements ExtractionProvider {
       contents = `Extract structured invoice JSON from the following native PDF text.\n\n<untrusted_invoice_document nonce="${nonce}">\n${formattedPages}\n</untrusted_invoice_document>`;
     }
 
-    const candidateModels =
-      config.geminiFallbackModel && config.geminiFallbackModel !== this.modelName
-        ? [this.modelName, config.geminiFallbackModel]
-        : [this.modelName];
+    const candidateModels = Array.from(
+      new Set([this.modelName, config.geminiFallbackModel, 'gemini-2.5-flash'].filter(Boolean))
+    );
 
     let lastError: unknown;
     for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
@@ -370,8 +372,8 @@ export class GeminiExtractionProvider implements ExtractionProvider {
           return { payload: validated, latencyMs: Date.now() - start, modelUsed: activeModel };
         } catch (err) {
           lastError = err;
-          const transient = isTransientCapacityError(err);
-          if (!transient) {
+          const canFallback = isFallbackEligibleError(err);
+          if (!canFallback) {
             throw err instanceof Error ? err : new Error(String(err));
           }
           hitCapacityLimit = true;

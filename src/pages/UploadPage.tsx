@@ -6,9 +6,11 @@ import {
   CheckCircle2,
   Download,
   FileUp,
+  Film,
   Play,
   Trash2,
   UploadCloud,
+  X,
   XCircle,
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -55,6 +57,7 @@ export function UploadPage() {
   const [uploading, setUploading] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [runningFixtureKey, setRunningFixtureKey] = useState<string | null>(null);
+  const [showOverviewVideo, setShowOverviewVideo] = useState(false);
 
   const { data: fixturesData } = useQuery({
     queryKey: ['fixtures'],
@@ -198,14 +201,61 @@ export function UploadPage() {
 
   return (
     <div className="space-y-6 max-w-5xl">
-      <div>
-        <h1 className="text-2xl font-display font-semibold tracking-tight text-slate-900 dark:text-slate-50">
-          Upload Vendor Invoices
-        </h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-          Upload real PDF invoices (native text or scanned images) to execute the 8-stage pipeline live
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-display font-semibold tracking-tight text-slate-900 dark:text-slate-50">
+            Upload Vendor Invoices
+          </h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
+            Upload real PDF invoices (native text or scanned images) to execute the 8-stage pipeline live
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="secondary" onClick={() => setShowOverviewVideo(true)}>
+            <Film className="w-3.5 h-3.5" />
+            Overview Video
+          </Button>
+          <a
+            href="/invoicedesk-overview.mp4"
+            download="invoicedesk-overview.mp4"
+            className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Download MP4
+          </a>
+        </div>
       </div>
+
+      {showOverviewVideo && (
+        <Card className="overflow-hidden border-slate-300 dark:border-slate-700">
+          <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                InvoiceDesk Product Overview (720p MP4)
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                32s architectural & edge-case summary teaser
+              </p>
+            </div>
+            <button
+              onClick={() => setShowOverviewVideo(false)}
+              className="p-1.5 rounded text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+              aria-label="Close video preview"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="bg-slate-950">
+            <video
+              src="/invoicedesk-overview.mp4"
+              controls
+              autoPlay
+              playsInline
+              className="w-full max-h-[420px] mx-auto"
+            />
+          </div>
+        </Card>
+      )}
 
       {globalError && <ErrorBanner message={globalError} />}
 
