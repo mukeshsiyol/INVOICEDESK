@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: invoicedesk
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: JWT_SECRET
+        generateValue: true
+      - key: APP_ENV
+        value: demo
+      - key: ENABLE_DEMO_ROLE_SWITCHER
+        value: "true"
+      - key: PAUSE_AUTH_FOR_DEMO
+        value: "true"
+    # Optional for paid Render plans to persist SQLite & uploaded PDFs across deploys:
+    # disk:
+    #   name: invoicedesk-data
+    #   mountPath: /app/data
+    #   sizeGB: 1

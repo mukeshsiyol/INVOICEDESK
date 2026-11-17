@@ -45,6 +45,7 @@ The included `Dockerfile` builds the Vite SPA and runs the Express + SQLite serv
 
 - **Build command:** `npm ci && npm run build`
 - **Start command:** `npm start`
+- **Render Blueprint (`render.yaml`):** Connect your GitHub repo via **New → Blueprint** in Render; it automatically uses `Dockerfile` (Node 22), `/api/v1/health`, and prompts you for `GEMINI_API_KEY`.
 - **Required env vars:** `GEMINI_API_KEY` (and set `PAUSE_AUTH_FOR_DEMO="false"` + `JWT_SECRET` if deploying for real multi-user login)
 - **Docker:**
   ```bash
