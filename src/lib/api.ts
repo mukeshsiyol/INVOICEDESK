@@ -66,6 +66,50 @@ export async function apiFetch<T = any>(path: string, init?: RequestInit): Promi
   return res.json() as Promise<T>;
 }
 
+export async function downloadCsv(path: string, fallbackFilename: string): Promise<void> {
+  const headers: Record<string, string> = {};
+  const storedDemoRole =
+    typeof window !== 'undefined' ? window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY) : null;
+  if (storedDemoRole === 'OPERATOR' || storedDemoRole === 'REVIEWER' || storedDemoRole === 'ADMIN') {
+    headers['X-Demo-Role'] = storedDemoRole;
+  }
+
+  const res = await fetch(`/api/v1${path}`, {
+    credentials: 'include',
+    headers,
+  });
+
+  if (!res.ok) {
+    let payload: any = null;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+    const errObj = payload?.error;
+    throw new ApiError(
+      res.status,
+      errObj?.code || `HTTP_${res.status}`,
+      errObj?.message || res.statusText || 'CSV export failed',
+      errObj?.details || {}
+    );
+  }
+
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const filename = match?.[1] || fallbackFilename;
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export function formatCurrency(val: string | number | null | undefined, currency = 'USD'): string {
   if (val === null || val === undefined || val === '') return '—';
   const num = typeof val === 'number' ? val : Number(val);

@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Building2, Plus, Search, X } from 'lucide-react';
+import { Building2, Download, Plus, Search, X } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch, formatCurrency, formatShortDate } from '../lib/api';
+import { apiFetch, downloadCsv, formatCurrency, formatShortDate } from '../lib/api';
 import {
   Button,
   Card,
@@ -32,6 +32,9 @@ export function VendorsPage() {
   const [newStatus, setNewStatus] = useState<'APPROVED' | 'UNVERIFIED'>('APPROVED');
   const [aliasInput, setAliasInput] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
+  const [exportingCsv, setExportingCsv] = useState(false);
+  const [exportingVendorCsv, setExportingVendorCsv] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     const v = searchParams.get('vendor');
@@ -94,6 +97,36 @@ export function VendorsPage() {
     return <span className="font-mono text-[11px] font-semibold text-amber-700 dark:text-amber-400">UNVERIFIED</span>;
   };
 
+  const handleExportVendors = async () => {
+    setExportError(null);
+    setExportingCsv(true);
+    try {
+      await downloadCsv(
+        `/vendors/export?q=${encodeURIComponent(q.trim())}&status=${statusFilter}`,
+        'invoicedesk_vendor_report.csv'
+      );
+    } catch (err: any) {
+      setExportError(err?.message || 'Unable to export vendor report CSV.');
+    } finally {
+      setExportingCsv(false);
+    }
+  };
+
+  const handleExportSingleVendor = async (vendorId: string, vendorCode: string) => {
+    setExportError(null);
+    setExportingVendorCsv(true);
+    try {
+      await downloadCsv(
+        `/vendors/${vendorId}/export`,
+        `invoicedesk_vendor_${vendorCode}.csv`
+      );
+    } catch (err: any) {
+      setExportError(err?.message || 'Unable to export vendor ledger CSV.');
+    } finally {
+      setExportingVendorCsv(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -105,13 +138,21 @@ export function VendorsPage() {
             Supplier master records, invoice header aliases, tax IDs, and verification status
           </p>
         </div>
-        {isAdmin && (
-          <Button variant="primary" onClick={() => setCreateOpen(true)}>
-            <Plus className="w-4 h-4" />
-            Add Vendor
+        <div className="flex items-center gap-2 shrink-0">
+          <Button variant="secondary" loading={exportingCsv} onClick={() => void handleExportVendors()}>
+            <Download className="w-4 h-4" />
+            Export Vendor Report CSV
           </Button>
-        )}
+          {isAdmin && (
+            <Button variant="primary" onClick={() => setCreateOpen(true)}>
+              <Plus className="w-4 h-4" />
+              Add Vendor
+            </Button>
+          )}
+        </div>
       </div>
+
+      {exportError && <ErrorBanner message={exportError} />}
 
       <Card className="p-3.5 flex flex-wrap items-center gap-3">
         <div className="relative flex-1 min-w-[220px]">
@@ -200,27 +241,40 @@ export function VendorsPage() {
       >
         {detailData?.vendor && (
           <div className="space-y-6">
-            <div className="flex items-center justify-between p-3.5 rounded-md border border-slate-200 dark:border-slate-800 text-xs">
+            <div className="flex items-center justify-between gap-2 p-3.5 rounded-md border border-slate-200 dark:border-slate-800 text-xs">
               <div>
                 <span className="text-slate-500 mr-2">Verification Status:</span>
                 {statusBadge(detailData.vendor.verification_status)}
               </div>
-              {canVerify && (
-                <select
-                  value={detailData.vendor.verification_status}
-                  onChange={(e) =>
-                    updateVendorMutation.mutate({
-                      vendorId: detailData.vendor.id,
-                      body: { verification_status: e.target.value },
-                    })
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  loading={exportingVendorCsv}
+                  onClick={() =>
+                    void handleExportSingleVendor(detailData.vendor.id, detailData.vendor.vendor_code)
                   }
-                  className="h-8 px-2 text-xs rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
                 >
-                  <option value="APPROVED">APPROVED</option>
-                  <option value="UNVERIFIED">UNVERIFIED</option>
-                  <option value="BLOCKED">BLOCKED</option>
-                </select>
-              )}
+                  <Download className="w-3.5 h-3.5" />
+                  Export Report CSV
+                </Button>
+                {canVerify && (
+                  <select
+                    value={detailData.vendor.verification_status}
+                    onChange={(e) =>
+                      updateVendorMutation.mutate({
+                        vendorId: detailData.vendor.id,
+                        body: { verification_status: e.target.value },
+                      })
+                    }
+                    className="h-8 px-2 text-xs rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800"
+                  >
+                    <option value="APPROVED">APPROVED</option>
+                    <option value="UNVERIFIED">UNVERIFIED</option>
+                    <option value="BLOCKED">BLOCKED</option>
+                  </select>
+                )}
+              </div>
             </div>
 
             <div>

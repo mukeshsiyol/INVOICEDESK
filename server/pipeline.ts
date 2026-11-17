@@ -17,10 +17,12 @@ import {
 } from './engine.ts';
 import {
   defaultExtractionProvider,
+  generateReviewerBrief,
   inspectPdfNativeText,
   readStoredPdf,
   validatePdfBuffer,
 } from './extraction.ts';
+import { createWorkspaceNotification } from './notifications.ts';
 
 export interface SseEventPayload {
   id: number;
@@ -398,7 +400,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       runId,
       stageNumber: 5,
       status: 'STARTED',
-      summary: 'Checking SHA-256 fingerprint and normalized (vendor, invoice_number) uniqueness...',
+      summary: 'Checking SHA-256 fingerprint, vendor, normalized invoice number, and invoice date uniqueness...',
     });
 
     const dupResult = runStage5DuplicateDetection(
@@ -415,10 +417,10 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       status: dupResult.isExactFileDuplicate || dupResult.isBusinessDuplicate || dupResult.isNearDuplicate ? 'WARNING' : 'COMPLETED',
       durationMs: Date.now() - s5Start,
       summary: dupResult.isBusinessDuplicate
-        ? `Duplicate detected (${dupResult.matchType}) matching ${dupResult.conflictingInvoiceNumber ?? dupResult.conflictingFilename}`
+        ? `Duplicate detected (${dupResult.matchedFields.join(' + ') || dupResult.matchType}) matching ${dupResult.conflictingInvoiceNumber ?? dupResult.conflictingFilename}`
         : dupResult.isNearDuplicate
-          ? `Near-duplicate warning matching ${dupResult.conflictingInvoiceNumber}`
-          : 'No prior duplicate or near-duplicate invoices found.',
+          ? `Redundancy warning (${dupResult.matchedFields.join(' + ') || 'VENDOR + DATE'}) matching ${dupResult.conflictingInvoiceNumber ?? dupResult.conflictingFilename}`
+          : 'No prior duplicate or redundant invoices found.',
       evidence: dupResult as unknown as Record<string, unknown>,
     });
 
@@ -504,6 +506,18 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       settings,
     });
 
+    const aiReviewerBrief =
+      decisionResult.outcome === 'APPROVE'
+        ? null
+        : await generateReviewerBrief({
+            outcome: decisionResult.outcome,
+            primaryReasonCode: decisionResult.primaryReasonCode,
+            explanation: decisionResult.explanation,
+            triggeredRules: decisionResult.triggeredRules,
+            extracted,
+            candidatePos: poMatch.candidatePos || [],
+          });
+
     const decisionId = crypto.randomUUID();
     const completedAt = isoNow();
     const totalDurationMs = Date.now() - runStartMs;
@@ -572,6 +586,11 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         }
       }
 
+      const fullEvidenceSnapshot = {
+        ...decisionResult.evidenceSnapshot,
+        ...(aiReviewerBrief ? { ai_reviewer_brief: aiReviewerBrief } : {}),
+      };
+
       db.prepare(
         `INSERT INTO decisions (id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -583,7 +602,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         finalReasonCode,
         JSON.stringify(finalTriggered),
         finalExplanation,
-        JSON.stringify(decisionResult.evidenceSnapshot),
+        JSON.stringify(fullEvidenceSnapshot),
         completedAt
       );
 
@@ -625,6 +644,30 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       });
 
       db.exec('COMMIT;');
+
+      if (finalReviewStatus === 'PENDING_REVIEW') {
+        const displayRef = extracted.invoice_number || invoiceRow.original_filename;
+        const vendorLabel = vendorResult.canonicalName || extracted.vendor.name;
+        const amtLabel =
+          extracted.total_amount && extracted.currency
+            ? ` · ${extracted.currency} ${extracted.total_amount}`
+            : '';
+        createWorkspaceNotification({
+          eventType: 'MANUAL_REVIEW_REQUIRED',
+          severity: 'WARNING',
+          title: 'Manual Review Required',
+          message: `${displayRef}${vendorLabel ? ` (${vendorLabel})` : ''}${amtLabel} routed for human review (${finalReasonCode}).`,
+          invoiceId: invoiceRow.id,
+          runId,
+          metadata: {
+            primary_reason_code: finalReasonCode,
+            business_decision: finalOutcome,
+            vendor_name: vendorLabel,
+            total_amount: extracted.total_amount,
+            currency: extracted.currency,
+          },
+        });
+      }
 
       const finalEventId = persistAndEmitStageEvent({
         runId,
@@ -676,6 +719,16 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       durationMs,
       summary: `Stage ${currentStage} failed: ${errMsg}`,
       evidence: { error_stage: currentStage, error_message: errMsg },
+    });
+
+    createWorkspaceNotification({
+      eventType: 'PIPELINE_FAILED',
+      severity: 'CRITICAL',
+      title: `Pipeline Failed (Stage ${currentStage})`,
+      message: `${invoiceRow.original_filename}: ${errMsg}`,
+      invoiceId: invoiceRow.id,
+      runId,
+      metadata: { error_stage: currentStage, error_message: errMsg },
     });
 
     sseBroker.publish(runId, {

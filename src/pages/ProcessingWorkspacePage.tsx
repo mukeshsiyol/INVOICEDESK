@@ -1,17 +1,23 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowLeft,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Clock,
+  Copy,
   ExternalLink,
+  Eye,
+  FileText,
   Loader2,
+  Mail,
   Play,
   RefreshCw,
   ShieldAlert,
+  Sparkles,
   UserCheck,
   UserX,
   XCircle,
@@ -25,6 +31,13 @@ import {
   formatDateTime,
   formatDurationMs,
 } from '../lib/api';
+import {
+  DEFAULT_REJECTION_BODY_TEMPLATE,
+  DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+  REJECTION_PLACEHOLDER_TOKENS,
+  renderRejectionTemplate,
+  type RejectionTemplateContext,
+} from '../lib/rejectionTemplate';
 import { PdfViewer } from '../components/pdf/PdfViewer';
 import {
   Button,
@@ -61,6 +74,21 @@ export function ProcessingWorkspacePage() {
   const [reviewModal, setReviewModal] = useState<'APPROVE_OVERRIDE' | 'REJECT_OVERRIDE' | null>(null);
   const [reviewNote, setReviewNote] = useState('');
   const [reviewError, setReviewError] = useState<string | null>(null);
+  const [rejectionTone, setRejectionTone] = useState<'formal' | 'collaborative' | 'concise'>('formal');
+  const [customDraftPrompt, setCustomDraftPrompt] = useState('');
+  const [draftSubject, setDraftSubject] = useState('');
+  const [draftBody, setDraftBody] = useState('');
+  const [customReasonText, setCustomReasonText] = useState('');
+  const [editingExplanation, setEditingExplanation] = useState(false);
+  const [activeTemplateField, setActiveTemplateField] = useState<'explanation' | 'subject' | 'body'>('body');
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [copiedEmail, setCopiedEmail] = useState(false);
+  const [reviewDraftExpanded, setReviewDraftExpanded] = useState(false);
+
+  const explanationRef = useRef<HTMLTextAreaElement | null>(null);
+  const subjectRef = useRef<HTMLInputElement | null>(null);
+  const bodyRef = useRef<HTMLTextAreaElement | null>(null);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['invoice', invoiceId, selectedRunId],
@@ -71,6 +99,11 @@ export function ProcessingWorkspacePage() {
       const st = query.state.data?.active_run?.status;
       return st === 'QUEUED' || st === 'RUNNING' ? 2500 : false;
     },
+  });
+
+  const { data: settingsData } = useQuery({
+    queryKey: ['settings'],
+    queryFn: () => apiFetch<any>('/settings'),
   });
 
   const activeRun = data?.active_run;
@@ -144,6 +177,113 @@ export function ProcessingWorkspacePage() {
       setReviewError(err?.message || 'Unable to submit review decision.');
     },
   });
+
+  const persistedRejectionNotice = data?.decision?.evidence_snapshot?.ai_rejection_notice || null;
+
+  useEffect(() => {
+    if (persistedRejectionNotice) {
+      setDraftSubject((prev) => prev || persistedRejectionNotice.email_subject || '');
+      setDraftBody((prev) => prev || persistedRejectionNotice.email_body || '');
+      setCustomReasonText((prev) => prev || persistedRejectionNotice.plain_english_summary || '');
+      if (
+        persistedRejectionNotice.tone === 'formal' ||
+        persistedRejectionNotice.tone === 'collaborative' ||
+        persistedRejectionNotice.tone === 'concise'
+      ) {
+        setRejectionTone(persistedRejectionNotice.tone);
+      }
+      return;
+    }
+
+    if (data?.decision && !draftSubject && !draftBody) {
+      setDraftSubject(
+        settingsData?.rejection_email_subject_template || DEFAULT_REJECTION_SUBJECT_TEMPLATE
+      );
+      setDraftBody(
+        settingsData?.rejection_email_body_template || DEFAULT_REJECTION_BODY_TEMPLATE
+      );
+      setCustomReasonText(data.decision.explanation || '');
+    }
+  }, [
+    persistedRejectionNotice?.generated_at,
+    persistedRejectionNotice?.email_subject,
+    persistedRejectionNotice?.email_body,
+    persistedRejectionNotice?.plain_english_summary,
+    persistedRejectionNotice?.tone,
+    data?.decision?.id,
+    settingsData?.rejection_email_subject_template,
+    settingsData?.rejection_email_body_template,
+  ]);
+
+  const rejectionDraftMutation = useMutation({
+    mutationFn: (payload: {
+      tone: 'formal' | 'collaborative' | 'concise';
+      custom_instructions?: string;
+      subject_template?: string;
+      body_template?: string;
+    }) =>
+      apiFetch<{ draft: any }>(`/invoices/${invoiceId}/rejection-draft`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
+    onSuccess: (res) => {
+      setDraftError(null);
+      if (res?.draft) {
+        setDraftSubject(res.draft.email_subject || '');
+        setDraftBody(res.draft.email_body || '');
+        setCustomReasonText(res.draft.plain_english_summary || '');
+      }
+      void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId] });
+    },
+    onError: (err: any) => {
+      setDraftError(err?.message || 'Unable to generate AI rejection explanation and email draft.');
+    },
+  });
+
+  const insertRejectionPlaceholder = (token: string) => {
+    if (activeTemplateField === 'explanation') {
+      setEditingExplanation(true);
+      const el = explanationRef.current;
+      const cur = customReasonText;
+      const start = el?.selectionStart ?? cur.length;
+      const end = el?.selectionEnd ?? cur.length;
+      setCustomReasonText(cur.slice(0, start) + token + cur.slice(end));
+      window.requestAnimationFrame(() => {
+        if (explanationRef.current) {
+          explanationRef.current.focus();
+          explanationRef.current.setSelectionRange(start + token.length, start + token.length);
+        }
+      });
+      return;
+    }
+
+    if (activeTemplateField === 'subject') {
+      const el = subjectRef.current;
+      const cur = draftSubject;
+      const start = el?.selectionStart ?? cur.length;
+      const end = el?.selectionEnd ?? cur.length;
+      setDraftSubject(cur.slice(0, start) + token + cur.slice(end));
+      window.requestAnimationFrame(() => {
+        if (el) {
+          el.focus();
+          el.setSelectionRange(start + token.length, start + token.length);
+        }
+      });
+      return;
+    }
+
+    const el = bodyRef.current;
+    const cur = draftBody;
+    const start = el?.selectionStart ?? cur.length;
+    const end = el?.selectionEnd ?? cur.length;
+    setDraftBody(cur.slice(0, start) + token + cur.slice(end));
+    window.requestAnimationFrame(() => {
+      if (el) {
+        el.focus();
+        el.setSelectionRange(start + token.length, start + token.length);
+      }
+    });
+  };
 
   if (isLoading) {
     return (
@@ -404,6 +544,36 @@ export function ProcessingWorkspacePage() {
                 {decision.explanation}
               </p>
 
+              {decision.evidence_snapshot?.ai_reviewer_brief && (
+                <div className="mt-3 p-3 rounded-md bg-white/80 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-700/80 space-y-1.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
+                      <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                      AI Reviewer Brief
+                    </span>
+                    {decision.evidence_snapshot.ai_reviewer_brief.suggested_po_number && (
+                      <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                        Suggested PO: {decision.evidence_snapshot.ai_reviewer_brief.suggested_po_number}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-700 dark:text-slate-300 leading-relaxed">
+                    {decision.evidence_snapshot.ai_reviewer_brief.summary}
+                  </p>
+                  <div className="text-slate-800 dark:text-slate-200">
+                    <span className="font-medium">Next step:</span>{' '}
+                    {decision.evidence_snapshot.ai_reviewer_brief.recommended_action}
+                  </div>
+                  {decision.evidence_snapshot.ai_reviewer_brief.verification_checks?.length > 0 && (
+                    <ul className="list-disc pl-4 text-slate-600 dark:text-slate-400 space-y-0.5 pt-0.5">
+                      {decision.evidence_snapshot.ai_reviewer_brief.verification_checks.map((chk: string, idx: number) => (
+                        <li key={idx}>{chk}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+
               {/* Preserved Original Decision + Human Override */}
               {invoice.review_status !== 'NOT_REQUIRED' && invoice.review_status !== 'PENDING_REVIEW' && (
                 <div className="mt-3 pt-3 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -443,6 +613,419 @@ export function ProcessingWorkspacePage() {
               </div>
             </Card>
           )}
+
+          {/* AI Rejection Explanation & Vendor Email Template Editor */}
+          {decision &&
+            (decision.outcome === 'REJECT' ||
+              invoice.business_decision === 'REJECT' ||
+              invoice.review_status === 'REJECTED_BY_HUMAN' ||
+              (decision.outcome === 'REVIEW' && invoice.review_status === 'PENDING_REVIEW')) && (() => {
+              const baseTemplateCtx: RejectionTemplateContext = {
+                vendorName: invoice.vendor_canonical_name || invoice.extracted_vendor_name || 'Vendor',
+                invoiceNumber: invoice.invoice_number || invoice.original_filename,
+                detailedExplanation:
+                  persistedRejectionNotice?.detailed_explanation || decision.explanation,
+                remediationSteps: persistedRejectionNotice?.remediation_steps || null,
+                primaryReasonCode: decision.primary_reason_code,
+                poNumber: invoice.matched_po_number || invoice.extracted_po_number || 'N/A',
+                invoiceAmount: invoice.total_amount
+                  ? formatCurrency(invoice.total_amount, invoice.currency || 'USD')
+                  : 'N/A',
+                invoiceDate: invoice.invoice_date || 'N/A',
+                workspaceName: settingsData?.workspace_name || 'InvoiceDesk',
+              };
+
+              const resolvedExplanation = renderRejectionTemplate(
+                customReasonText ||
+                  persistedRejectionNotice?.plain_english_summary ||
+                  decision.explanation ||
+                  '',
+                baseTemplateCtx
+              );
+              const fullTemplateCtx: RejectionTemplateContext = {
+                ...baseTemplateCtx,
+                reasonForRejection: resolvedExplanation.rendered,
+              };
+              const resolvedSubject = renderRejectionTemplate(draftSubject, fullTemplateCtx);
+              const resolvedBody = renderRejectionTemplate(draftBody, fullTemplateCtx);
+
+              return (
+                <Card className="p-4 space-y-3 border-slate-200 dark:border-slate-800">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded-md bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center">
+                        <Mail className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                          {decision.outcome === 'REJECT' ||
+                          invoice.business_decision === 'REJECT' ||
+                          invoice.review_status === 'REJECTED_BY_HUMAN'
+                            ? 'AI Rejection Explanation & Email Template Editor'
+                            : 'AI Vendor Rejection / Exception Template Editor'}
+                        </h2>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Customize placeholders like [Vendor Name], [Invoice Number], and [Reason for Rejection], then Preview
+                        </p>
+                      </div>
+                    </div>
+
+                    {decision.outcome === 'REVIEW' &&
+                      invoice.review_status === 'PENDING_REVIEW' &&
+                      !persistedRejectionNotice &&
+                      !reviewDraftExpanded && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => setReviewDraftExpanded(true)}
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          Draft Rejection Notice
+                        </Button>
+                      )}
+                  </div>
+
+                  {(decision.outcome === 'REJECT' ||
+                    invoice.business_decision === 'REJECT' ||
+                    invoice.review_status === 'REJECTED_BY_HUMAN' ||
+                    Boolean(persistedRejectionNotice) ||
+                    reviewDraftExpanded) && (
+                    <div className="space-y-3 pt-1">
+                      {draftError && <ErrorBanner message={draftError} />}
+
+                      {/* Controls Bar */}
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <div className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 p-0.5 shrink-0">
+                          {(['formal', 'collaborative', 'concise'] as const).map((t) => (
+                            <button
+                              key={t}
+                              type="button"
+                              onClick={() => setRejectionTone(t)}
+                              className={`px-2.5 py-1 text-xs font-medium rounded capitalize cursor-pointer transition-colors ${
+                                rejectionTone === t
+                                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                                  : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                              }`}
+                            >
+                              {t}
+                            </button>
+                          ))}
+                        </div>
+
+                        <input
+                          type="text"
+                          value={customDraftPrompt}
+                          onChange={(e) => setCustomDraftPrompt(e.target.value)}
+                          placeholder="Optional AI instruction (e.g. ask vendor to reference PO-2025-1001)…"
+                          maxLength={300}
+                          className="flex-1 h-8 px-2.5 text-xs rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          loading={rejectionDraftMutation.isPending}
+                          onClick={() =>
+                            rejectionDraftMutation.mutate({
+                              tone: rejectionTone,
+                              custom_instructions: customDraftPrompt.trim() || undefined,
+                              subject_template: draftSubject.trim() || undefined,
+                              body_template: draftBody.trim() || undefined,
+                            })
+                          }
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          {persistedRejectionNotice ? 'Regenerate with AI' : 'Explain & Draft Email'}
+                        </Button>
+                      </div>
+
+                      {/* Plain-English Rejection Breakdown (supports placeholders inside [Reason for Rejection]) */}
+                      <div className="p-3 rounded-md bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 space-y-2 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-semibold text-slate-900 dark:text-slate-100">
+                            {persistedRejectionNotice
+                              ? 'Generated Explanation ([Reason for Rejection])'
+                              : 'Rule Explanation ([Reason for Rejection])'}
+                          </span>
+                          <div className="flex items-center gap-2">
+                            {persistedRejectionNotice && (
+                              <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">
+                                {persistedRejectionNotice.generated_by_model} · {persistedRejectionNotice.tone}
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingExplanation((v) => !v);
+                                setActiveTemplateField('explanation');
+                              }}
+                              className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                            >
+                              {editingExplanation ? 'Done Editing' : 'Customize Placeholders'}
+                            </button>
+                          </div>
+                        </div>
+
+                        {editingExplanation ? (
+                          <div className="space-y-1.5">
+                            <textarea
+                              ref={explanationRef}
+                              rows={3}
+                              value={customReasonText}
+                              onFocus={() => setActiveTemplateField('explanation')}
+                              onChange={(e) => setCustomReasonText(e.target.value)}
+                              placeholder="Customize the explanation or insert placeholders like [Vendor Name], [Invoice Number], [PO Number]..."
+                              className="w-full p-2 text-xs font-mono rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <p className="text-[11px] text-slate-500">
+                              Preview resolves placeholders inside this explanation and fills{' '}
+                              <span className="font-mono">[Reason for Rejection]</span>.
+                            </p>
+                          </div>
+                        ) : (
+                          <p className="font-medium text-slate-800 dark:text-slate-200">
+                            {resolvedExplanation.rendered}
+                          </p>
+                        )}
+
+                        {persistedRejectionNotice?.detailed_explanation && (
+                          <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+                            {persistedRejectionNotice.detailed_explanation}
+                          </p>
+                        )}
+
+                        {persistedRejectionNotice?.remediation_steps?.length > 0 && (
+                          <div className="pt-1">
+                            <div className="font-medium text-slate-700 dark:text-slate-300 mb-1">
+                              Required Remediation Steps ([Remediation Steps]):
+                            </div>
+                            <ul className="list-disc pl-4 space-y-0.5 text-slate-600 dark:text-slate-400">
+                              {persistedRejectionNotice.remediation_steps.map((step: string, idx: number) => (
+                                <li key={idx}>{step}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Placeholder Toolbar */}
+                      <div className="p-2.5 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/30 space-y-1.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                          <span className="font-medium text-slate-700 dark:text-slate-300">
+                            Insert Placeholder into{' '}
+                            <span className="font-mono text-blue-600 dark:text-blue-400">
+                              {activeTemplateField === 'explanation'
+                                ? 'Explanation'
+                                : activeTemplateField === 'subject'
+                                  ? 'Subject'
+                                  : 'Email Body'}
+                            </span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDraftSubject(
+                                settingsData?.rejection_email_subject_template ||
+                                  DEFAULT_REJECTION_SUBJECT_TEMPLATE
+                              );
+                              setDraftBody(
+                                settingsData?.rejection_email_body_template ||
+                                  DEFAULT_REJECTION_BODY_TEMPLATE
+                              );
+                            }}
+                            className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 cursor-pointer"
+                          >
+                            <FileText className="w-3 h-3" />
+                            Load Workspace Template
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {REJECTION_PLACEHOLDER_TOKENS.map((item) => (
+                            <button
+                              key={item.token}
+                              type="button"
+                              title={item.description}
+                              onClick={() => insertRejectionPlaceholder(item.token)}
+                              className="px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-mono text-blue-700 dark:text-blue-300 hover:border-blue-400 cursor-pointer"
+                            >
+                              {item.token}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Editable Email Template / Draft */}
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <label
+                            htmlFor="rejection-email-subject"
+                            className="text-xs font-semibold text-slate-800 dark:text-slate-200"
+                          >
+                            Rejection Email Template / Draft
+                          </label>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => setPreviewOpen(true)}
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              Preview
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => {
+                                const fullText = `Subject: ${resolvedSubject.rendered}\n\n${resolvedBody.rendered}`;
+                                void navigator.clipboard.writeText(fullText);
+                                setCopiedEmail(true);
+                                window.setTimeout(() => setCopiedEmail(false), 2000);
+                              }}
+                            >
+                              {copiedEmail ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  Copied
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  Copy Email
+                                </>
+                              )}
+                            </Button>
+                            <a
+                              href={`mailto:?subject=${encodeURIComponent(resolvedSubject.rendered)}&body=${encodeURIComponent(resolvedBody.rendered)}`}
+                              className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
+                            >
+                              <Mail className="w-3.5 h-3.5" />
+                              Open in Mail App
+                            </a>
+                          </div>
+                        </div>
+
+                        <input
+                          ref={subjectRef}
+                          id="rejection-email-subject"
+                          type="text"
+                          value={draftSubject}
+                          onFocus={() => setActiveTemplateField('subject')}
+                          onChange={(e) => setDraftSubject(e.target.value)}
+                          className="w-full h-8 px-2.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          placeholder="Email subject (supports [Vendor Name], [Invoice Number], etc.)"
+                        />
+                        <textarea
+                          ref={bodyRef}
+                          rows={8}
+                          value={draftBody}
+                          onFocus={() => setActiveTemplateField('body')}
+                          onChange={(e) => setDraftBody(e.target.value)}
+                          className="w-full p-2.5 text-xs leading-relaxed rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          placeholder="Vendor rejection email template or body"
+                        />
+                      </div>
+
+                      {/* Preview Modal */}
+                      <Modal
+                        open={previewOpen}
+                        onClose={() => setPreviewOpen(false)}
+                        title="Final Rejection Email Preview"
+                      >
+                        <div className="space-y-4">
+                          {Array.from(
+                            new Set([
+                              ...resolvedSubject.unresolvedTokens,
+                              ...resolvedBody.unresolvedTokens,
+                            ])
+                          ).length > 0 && (
+                            <div className="p-2.5 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-800 dark:text-amber-200">
+                              Unrecognized placeholders:{' '}
+                              <span className="font-mono">
+                                {Array.from(
+                                  new Set([
+                                    ...resolvedSubject.unresolvedTokens,
+                                    ...resolvedBody.unresolvedTokens,
+                                  ])
+                                ).join(', ')}
+                              </span>
+                            </div>
+                          )}
+
+                          <div className="rounded-md border border-slate-200 dark:border-slate-800 overflow-hidden">
+                            <div className="px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 space-y-1 text-xs">
+                              <div>
+                                <span className="text-slate-500">From:</span>{' '}
+                                <span className="font-medium text-slate-900 dark:text-slate-100">
+                                  {fullTemplateCtx.workspaceName} Accounts Payable
+                                </span>
+                              </div>
+                              <div>
+                                <span className="text-slate-500">To:</span>{' '}
+                                <span className="font-medium text-slate-900 dark:text-slate-100">
+                                  {fullTemplateCtx.vendorName} Billing Team
+                                </span>
+                              </div>
+                              <div>
+                                <span className="text-slate-500">Subject:</span>{' '}
+                                <span className="font-semibold text-slate-900 dark:text-slate-100">
+                                  {resolvedSubject.rendered}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="p-3.5 bg-white dark:bg-slate-900 text-xs text-slate-800 dark:text-slate-200 whitespace-pre-wrap leading-relaxed max-h-[360px] overflow-y-auto">
+                              {resolvedBody.rendered}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center justify-end gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => {
+                                const fullText = `Subject: ${resolvedSubject.rendered}\n\n${resolvedBody.rendered}`;
+                                void navigator.clipboard.writeText(fullText);
+                                setCopiedEmail(true);
+                                window.setTimeout(() => setCopiedEmail(false), 2000);
+                              }}
+                            >
+                              {copiedEmail ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  Copied
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  Copy Final Email
+                                </>
+                              )}
+                            </Button>
+                            <a
+                              href={`mailto:?subject=${encodeURIComponent(resolvedSubject.rendered)}&body=${encodeURIComponent(resolvedBody.rendered)}`}
+                              className="inline-flex items-center gap-1.5 h-8 px-3 text-xs font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 whitespace-nowrap"
+                            >
+                              <Mail className="w-3.5 h-3.5" />
+                              Open in Mail App
+                            </a>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              onClick={() => setPreviewOpen(false)}
+                            >
+                              Close
+                            </Button>
+                          </div>
+                        </div>
+                      </Modal>
+                    </div>
+                  )}
+                </Card>
+              );
+            })()}
 
           {/* 8-Stage Execution Timeline */}
           <Card className="overflow-hidden">
@@ -659,12 +1242,24 @@ export function ProcessingWorkspacePage() {
                       </span>
                     </div>
                     <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300">
-                      Subtotal ({formatCurrency(invoice.subtotal_amount, invoice.currency)}) + Tax (
-                      {formatCurrency(invoice.tax_amount ?? 0, invoice.currency)}) = Expected{' '}
+                      {validationSnap?.taxMode === 'EMBEDDED' ? (
+                        <>
+                          Tax-Inclusive Subtotal ({formatCurrency(invoice.subtotal_amount, invoice.currency)}, incl.{' '}
+                          {formatCurrency(invoice.tax_amount ?? 0, invoice.currency)} tax) = Expected{' '}
+                        </>
+                      ) : (
+                        <>
+                          Subtotal ({formatCurrency(invoice.subtotal_amount, invoice.currency)}) + Tax (
+                          {formatCurrency(invoice.tax_amount ?? 0, invoice.currency)}) = Expected{' '}
+                        </>
+                      )}
                       {validationSnap?.expectedTotal
                         ? formatCurrency(validationSnap.expectedTotal, invoice.currency)
                         : '—'}{' '}
                       vs. Stated {formatCurrency(invoice.total_amount, invoice.currency)}
+                      {validationSnap?.taxMode && (
+                        <span className="text-slate-400 ml-1.5">[{validationSnap.taxMode}]</span>
+                      )}
                       {validationSnap?.arithmeticDelta && validationSnap.arithmeticDelta !== '0.00' && (
                         <span className="text-rose-600 font-semibold ml-1.5">
                           (Delta: {validationSnap.arithmeticDelta})

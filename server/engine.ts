@@ -27,6 +27,7 @@ export interface ApplicationSettingsRow {
   tolerance_mode: string;
   confidence_threshold: string;
   auto_approve_max_amount: string | null;
+  notify_on_upload?: number;
   notify_on_review: number;
   notify_on_failure: number;
 }
@@ -39,6 +40,7 @@ export interface ValidationResult {
   lineSumDelta: string | null;
   expectedTotal: string | null;
   statedTotal: string | null;
+  taxMode: 'SEPARATED' | 'EMBEDDED' | 'EXEMPT' | 'UNKNOWN';
   lowConfidenceFields: Array<{ field: string; confidence: number; threshold: number }>;
   isCreditNote: boolean;
 }
@@ -61,7 +63,10 @@ export interface DuplicateCheckResult {
   conflictingInvoiceId: string | null;
   conflictingInvoiceNumber: string | null;
   conflictingFilename: string | null;
+  conflictingVendorName: string | null;
+  conflictingInvoiceDate: string | null;
   conflictingCreatedAt: string | null;
+  matchedFields: Array<'FILE_SHA256' | 'VENDOR' | 'INVOICE_NUMBER' | 'INVOICE_DATE' | 'AMOUNT'>;
   matchType: 'FILE_SHA256' | 'VENDOR_INVOICE_KEY' | 'NEAR_DUPLICATE' | 'NONE';
 }
 
@@ -160,6 +165,7 @@ export function runStage3Validation(
   const subDec = parseDecimalSafe(extracted.subtotal);
   const taxDec = parseDecimalSafe(extracted.tax_amount) ?? new Decimal(0);
   const discDec = parseDecimalSafe(extracted.discount_amount) ?? new Decimal(0);
+  const taxMode = extracted.tax_mode || 'UNKNOWN';
 
   let arithmeticValid = true;
   let arithmeticDelta: string | null = null;
@@ -168,14 +174,31 @@ export function runStage3Validation(
   const roundingTol = new Decimal('0.02');
 
   if (totalDec !== null && subDec !== null) {
-    const calc = subDec.plus(taxDec).minus(discDec);
-    expectedTotal = calc.toFixed(2);
-    const delta = totalDec.minus(calc);
-    if (delta.abs().gt(roundingTol)) {
-      arithmeticValid = false;
-      arithmeticDelta = delta.toFixed(2);
+    const separatedCalc = subDec.plus(taxDec).minus(discDec);
+    if (taxMode === 'EMBEDDED') {
+      const embeddedCalc = subDec.minus(discDec);
+      const embDelta = totalDec.minus(embeddedCalc);
+      const sepDelta = totalDec.minus(separatedCalc);
+      if (embDelta.abs().lte(roundingTol)) {
+        expectedTotal = embeddedCalc.toFixed(2);
+        arithmeticDelta = '0.00';
+      } else if (sepDelta.abs().lte(roundingTol)) {
+        expectedTotal = separatedCalc.toFixed(2);
+        arithmeticDelta = '0.00';
+      } else {
+        arithmeticValid = false;
+        expectedTotal = embeddedCalc.toFixed(2);
+        arithmeticDelta = embDelta.toFixed(2);
+      }
     } else {
-      arithmeticDelta = '0.00';
+      expectedTotal = separatedCalc.toFixed(2);
+      const delta = totalDec.minus(separatedCalc);
+      if (delta.abs().gt(roundingTol)) {
+        arithmeticValid = false;
+        arithmeticDelta = delta.toFixed(2);
+      } else {
+        arithmeticDelta = '0.00';
+      }
     }
   }
 
@@ -191,10 +214,12 @@ export function runStage3Validation(
       lineSum = lineSum.plus(lt);
     }
     if (allLinesValid) {
-      const lDelta = subDec.minus(lineSum);
-      if (lDelta.abs().gt(roundingTol)) {
+      const subDelta = subDec.minus(lineSum);
+      const totDelta = totalDec !== null ? totalDec.minus(lineSum) : null;
+      const matchesEmbeddedTotal = taxMode === 'EMBEDDED' && totDelta !== null && totDelta.abs().lte(roundingTol);
+      if (subDelta.abs().gt(roundingTol) && !matchesEmbeddedTotal) {
         arithmeticValid = false;
-        lineSumDelta = lDelta.toFixed(2);
+        lineSumDelta = subDelta.toFixed(2);
       }
     }
   }
@@ -232,6 +257,7 @@ export function runStage3Validation(
     lineSumDelta,
     expectedTotal,
     statedTotal: totalDec ? totalDec.toFixed(2) : null,
+    taxMode,
     lowConfidenceFields,
     isCreditNote,
   };
@@ -387,6 +413,22 @@ export function runStage4VendorVerification(
   };
 }
 
+function vendorsShareIdentity(
+  matchedVendorId: string | null,
+  extractedVendorName: string | null,
+  candidateVendorId: string | null,
+  candidateVendorName: string | null
+): boolean {
+  if (matchedVendorId && candidateVendorId && matchedVendorId === candidateVendorId) {
+    return true;
+  }
+  const normCurr = normalizeVendorName(extractedVendorName);
+  const normCand = normalizeVendorName(candidateVendorName);
+  if (!normCurr || !normCand) return false;
+  if (normCurr === normCand) return true;
+  return diceSimilarity(normCurr, normCand) >= 0.85;
+}
+
 export function runStage5DuplicateDetection(
   db: DatabaseSync,
   invoiceId: string,
@@ -397,13 +439,20 @@ export function runStage5DuplicateDetection(
   // 1. Exact binary SHA-256 check against prior non-failed invoices
   const fileMatch = db
     .prepare(
-      `SELECT id, invoice_number, original_filename, created_at
+      `SELECT id, invoice_number, original_filename, extracted_vendor_name, invoice_date, created_at
        FROM invoices
        WHERE file_sha256 = ? AND id != ? AND processing_status = 'COMPLETED' AND business_decision != 'REJECT'
        ORDER BY created_at ASC LIMIT 1`
     )
     .get(fileSha256, invoiceId) as
-    | { id: string; invoice_number: string | null; original_filename: string; created_at: string }
+    | {
+        id: string;
+        invoice_number: string | null;
+        original_filename: string;
+        extracted_vendor_name: string | null;
+        invoice_date: string | null;
+        created_at: string;
+      }
     | undefined;
 
   if (fileMatch) {
@@ -414,28 +463,64 @@ export function runStage5DuplicateDetection(
       conflictingInvoiceId: fileMatch.id,
       conflictingInvoiceNumber: fileMatch.invoice_number,
       conflictingFilename: fileMatch.original_filename,
+      conflictingVendorName: fileMatch.extracted_vendor_name,
+      conflictingInvoiceDate: fileMatch.invoice_date,
       conflictingCreatedAt: fileMatch.created_at,
+      matchedFields: ['FILE_SHA256'],
       matchType: 'FILE_SHA256',
     };
   }
 
-  // 2. Semantic business-key check: (vendor_id, normalized_invoice_number)
+  const totalDec = parseDecimalSafe(extracted.total_amount);
+  const currDateMs = extracted.invoice_date ? Date.parse(extracted.invoice_date) : Number.NaN;
   const normInvNo = normalizeDocNumber(extracted.invoice_number);
-  if (vendorResult.matchedVendorId && normInvNo) {
-    const bizMatch = db
+
+  // 2. Semantic business-key check: (vendor [linked or normalized name], normalized_invoice_number)
+  if (normInvNo && (vendorResult.matchedVendorId || normalizeVendorName(extracted.vendor.name))) {
+    const bizCandidates = db
       .prepare(
-        `SELECT id, invoice_number, original_filename, created_at
+        `SELECT id, vendor_id, extracted_vendor_name, invoice_number, invoice_date, total_amount, original_filename, created_at
          FROM invoices
-         WHERE vendor_id = ? AND normalized_invoice_number = ? AND id != ?
+         WHERE normalized_invoice_number = ? AND id != ?
            AND processing_status = 'COMPLETED'
            AND (business_decision = 'APPROVE' OR review_status = 'APPROVED_BY_HUMAN' OR business_decision = 'REVIEW')
-         ORDER BY created_at ASC LIMIT 1`
+         ORDER BY created_at ASC`
       )
-      .get(vendorResult.matchedVendorId, normInvNo, invoiceId) as
-      | { id: string; invoice_number: string | null; original_filename: string; created_at: string }
-      | undefined;
+      .all(normInvNo, invoiceId) as Array<{
+      id: string;
+      vendor_id: string | null;
+      extracted_vendor_name: string | null;
+      invoice_number: string | null;
+      invoice_date: string | null;
+      total_amount: string | null;
+      original_filename: string;
+      created_at: string;
+    }>;
+
+    const bizMatch = bizCandidates.find((c) =>
+      vendorsShareIdentity(
+        vendorResult.matchedVendorId,
+        vendorResult.canonicalName ?? extracted.vendor.name,
+        c.vendor_id,
+        c.extracted_vendor_name
+      )
+    );
 
     if (bizMatch) {
+      const matchedFields: DuplicateCheckResult['matchedFields'] = ['VENDOR', 'INVOICE_NUMBER'];
+      const cDateMs = bizMatch.invoice_date ? Date.parse(bizMatch.invoice_date) : Number.NaN;
+      if (
+        !Number.isNaN(currDateMs) &&
+        !Number.isNaN(cDateMs) &&
+        Math.abs(currDateMs - cDateMs) <= 3 * 24 * 60 * 60 * 1000
+      ) {
+        matchedFields.push('INVOICE_DATE');
+      }
+      const cTotal = parseDecimalSafe(bizMatch.total_amount);
+      if (totalDec && cTotal && cTotal.eq(totalDec)) {
+        matchedFields.push('AMOUNT');
+      }
+
       return {
         isExactFileDuplicate: false,
         isBusinessDuplicate: true,
@@ -443,42 +528,75 @@ export function runStage5DuplicateDetection(
         conflictingInvoiceId: bizMatch.id,
         conflictingInvoiceNumber: bizMatch.invoice_number,
         conflictingFilename: bizMatch.original_filename,
+        conflictingVendorName: bizMatch.extracted_vendor_name,
+        conflictingInvoiceDate: bizMatch.invoice_date,
         conflictingCreatedAt: bizMatch.created_at,
+        matchedFields,
         matchType: 'VENDOR_INVOICE_KEY',
       };
     }
   }
 
-  // 3. Near-duplicate heuristic: same vendor + exact total + invoice_date within +-3 days
-  const totalDec = parseDecimalSafe(extracted.total_amount);
-  if (vendorResult.matchedVendorId && totalDec && extracted.invoice_date) {
+  // 3. Redundancy / Near-duplicate heuristic: same vendor + invoice_date within +-3 days
+  // Flags when amounts match identically OR exact same date with closely matching amount / missing invoice number
+  if (
+    extracted.invoice_date &&
+    !Number.isNaN(currDateMs) &&
+    (vendorResult.matchedVendorId || normalizeVendorName(extracted.vendor.name))
+  ) {
     const candidates = db
       .prepare(
-        `SELECT id, invoice_number, original_filename, total_amount, invoice_date, created_at
+        `SELECT id, vendor_id, extracted_vendor_name, invoice_number, normalized_invoice_number, original_filename, total_amount, invoice_date, created_at
          FROM invoices
-         WHERE vendor_id = ? AND id != ? AND processing_status = 'COMPLETED' AND business_decision != 'REJECT'
-           AND total_amount IS NOT NULL AND invoice_date IS NOT NULL`
+         WHERE id != ? AND processing_status = 'COMPLETED' AND business_decision != 'REJECT'
+           AND invoice_date IS NOT NULL
+         ORDER BY created_at ASC`
       )
-      .all(vendorResult.matchedVendorId, invoiceId) as Array<{
+      .all(invoiceId) as Array<{
       id: string;
+      vendor_id: string | null;
+      extracted_vendor_name: string | null;
       invoice_number: string | null;
+      normalized_invoice_number: string | null;
       original_filename: string;
-      total_amount: string;
+      total_amount: string | null;
       invoice_date: string;
       created_at: string;
     }>;
 
-    const currDateMs = Date.parse(extracted.invoice_date);
     for (const c of candidates) {
-      const cTotal = parseDecimalSafe(c.total_amount);
-      const cDateMs = Date.parse(c.invoice_date);
       if (
-        cTotal &&
-        cTotal.eq(totalDec) &&
-        !Number.isNaN(currDateMs) &&
-        !Number.isNaN(cDateMs) &&
-        Math.abs(currDateMs - cDateMs) <= 3 * 24 * 60 * 60 * 1000
+        !vendorsShareIdentity(
+          vendorResult.matchedVendorId,
+          vendorResult.canonicalName ?? extracted.vendor.name,
+          c.vendor_id,
+          c.extracted_vendor_name
+        )
       ) {
+        continue;
+      }
+
+      const cDateMs = Date.parse(c.invoice_date);
+      if (Number.isNaN(cDateMs)) continue;
+      const diffMs = Math.abs(currDateMs - cDateMs);
+      if (diffMs > 3 * 24 * 60 * 60 * 1000) continue;
+
+      const cTotal = parseDecimalSafe(c.total_amount);
+      const exactAmountMatch = Boolean(totalDec && cTotal && cTotal.eq(totalDec));
+      const sameDay = diffMs === 0;
+      const closeAmountMatch = Boolean(
+        totalDec &&
+          cTotal &&
+          Decimal.max(totalDec.abs(), cTotal.abs()).gt(0) &&
+          totalDec.minus(cTotal).abs().div(Decimal.max(totalDec.abs(), cTotal.abs())).lte('0.10')
+      );
+      const sameInvNo = Boolean(normInvNo && c.normalized_invoice_number && normInvNo === c.normalized_invoice_number);
+
+      if (exactAmountMatch || sameInvNo || (sameDay && closeAmountMatch)) {
+        const matchedFields: DuplicateCheckResult['matchedFields'] = ['VENDOR', 'INVOICE_DATE'];
+        if (sameInvNo) matchedFields.push('INVOICE_NUMBER');
+        if (exactAmountMatch) matchedFields.push('AMOUNT');
+
         return {
           isExactFileDuplicate: false,
           isBusinessDuplicate: false,
@@ -486,7 +604,10 @@ export function runStage5DuplicateDetection(
           conflictingInvoiceId: c.id,
           conflictingInvoiceNumber: c.invoice_number,
           conflictingFilename: c.original_filename,
+          conflictingVendorName: c.extracted_vendor_name,
+          conflictingInvoiceDate: c.invoice_date,
           conflictingCreatedAt: c.created_at,
+          matchedFields,
           matchType: 'NEAR_DUPLICATE',
         };
       }
@@ -500,7 +621,10 @@ export function runStage5DuplicateDetection(
     conflictingInvoiceId: null,
     conflictingInvoiceNumber: null,
     conflictingFilename: null,
+    conflictingVendorName: null,
+    conflictingInvoiceDate: null,
     conflictingCreatedAt: null,
+    matchedFields: [],
     matchType: 'NONE',
   };
 }
@@ -746,16 +870,20 @@ export function runStage8DecisionGeneration(params: {
   }
 
   if (duplicate.isExactFileDuplicate || duplicate.isBusinessDuplicate) {
+    const dateSuffix = duplicate.conflictingInvoiceDate ? ` dated ${duplicate.conflictingInvoiceDate}` : '';
     triggered.push({
       rule_id: 'R-02',
       reason_code: 'DUPLICATE_INVOICE',
       decision: 'REJECT',
       severity: 'CRITICAL',
-      message: `Duplicate of existing invoice ${duplicate.conflictingInvoiceNumber ?? 'record'} (uploaded as '${duplicate.conflictingFilename}').`,
+      message: `Duplicate of existing invoice ${duplicate.conflictingInvoiceNumber ?? 'record'}${dateSuffix} from ${duplicate.conflictingVendorName ?? vendor.canonicalName ?? 'same vendor'} (uploaded as '${duplicate.conflictingFilename}').`,
       evidence: {
         match_type: duplicate.matchType,
+        matched_fields: duplicate.matchedFields,
         conflicting_invoice_id: duplicate.conflictingInvoiceId,
         conflicting_invoice_number: duplicate.conflictingInvoiceNumber,
+        conflicting_vendor_name: duplicate.conflictingVendorName,
+        conflicting_invoice_date: duplicate.conflictingInvoiceDate,
         conflicting_filename: duplicate.conflictingFilename,
       },
     });
@@ -912,13 +1040,21 @@ export function runStage8DecisionGeneration(params: {
   }
 
   if (duplicate.isNearDuplicate) {
+    const dateNote = duplicate.conflictingInvoiceDate ? ` dated ${duplicate.conflictingInvoiceDate}` : ' within 3 days';
     triggered.push({
       rule_id: 'R-15',
       reason_code: 'NEAR_DUPLICATE_WARNING',
       decision: 'REVIEW',
       severity: 'MEDIUM',
-      message: `Resembles prior invoice ${duplicate.conflictingInvoiceNumber} from the same vendor for an identical amount within 3 days.`,
-      evidence: { conflicting_invoice_id: duplicate.conflictingInvoiceId },
+      message: `Potential redundant invoice resembling ${duplicate.conflictingInvoiceNumber ?? duplicate.conflictingFilename}${dateNote} from ${duplicate.conflictingVendorName ?? vendor.canonicalName ?? 'same vendor'} (matched on ${duplicate.matchedFields.join(', ') || 'VENDOR, INVOICE_DATE'}).`,
+      evidence: {
+        matched_fields: duplicate.matchedFields,
+        conflicting_invoice_id: duplicate.conflictingInvoiceId,
+        conflicting_invoice_number: duplicate.conflictingInvoiceNumber,
+        conflicting_vendor_name: duplicate.conflictingVendorName,
+        conflicting_invoice_date: duplicate.conflictingInvoiceDate,
+        conflicting_filename: duplicate.conflictingFilename,
+      },
     });
   }
 

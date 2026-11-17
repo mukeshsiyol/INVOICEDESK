@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, FileText, Play, Plus, RefreshCw, Search } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { apiFetch, formatCurrency, formatShortDate } from '../lib/api';
+import { apiFetch, downloadCsv, formatCurrency, formatShortDate } from '../lib/api';
 import {
   Button,
   Card,
@@ -105,9 +105,38 @@ export function InvoicesPage() {
     .filter(([, checked]) => checked)
     .map(([id]) => id);
 
-  const exportCsvUrl = `/api/v1/invoices/export${
-    selectedList.length ? `?ids=${selectedList.join(',')}` : ''
-  }`;
+  const [exportingCsv, setExportingCsv] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const hasActiveFilters = Boolean(
+    q.trim() || decision !== 'ALL' || procStatus !== 'ALL' || reviewStatus !== 'ALL'
+  );
+
+  const exportCsvPath = useMemo(() => {
+    const p = new URLSearchParams();
+    if (selectedList.length > 0) {
+      p.set('ids', selectedList.join(','));
+    } else {
+      if (q.trim()) p.set('q', q.trim());
+      if (decision !== 'ALL') p.set('decision', decision);
+      if (procStatus !== 'ALL') p.set('processing_status', procStatus);
+      if (reviewStatus !== 'ALL') p.set('review_status', reviewStatus);
+      p.set('sort', sort);
+    }
+    return `/invoices/export?${p.toString()}`;
+  }, [selectedList, q, decision, procStatus, reviewStatus, sort]);
+
+  const handleExportCsv = async () => {
+    setExportError(null);
+    setExportingCsv(true);
+    try {
+      await downloadCsv(exportCsvPath, 'invoicedesk_invoices.csv');
+    } catch (err: any) {
+      setExportError(err?.message || 'Unable to export invoices CSV.');
+    } finally {
+      setExportingCsv(false);
+    }
+  };
 
   const allSelected = Boolean(items.length) && items.every((item) => selectedIds[item.id]);
 
@@ -123,19 +152,22 @@ export function InvoicesPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <a
-            href={exportCsvUrl}
-            className="inline-flex items-center gap-2 h-9 px-3.5 text-sm font-medium rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap"
-          >
+          <Button variant="secondary" loading={exportingCsv} onClick={() => void handleExportCsv()}>
             <Download className="w-4 h-4" />
-            {selectedList.length ? `Export (${selectedList.length}) CSV` : 'Export CSV'}
-          </a>
+            {selectedList.length
+              ? `Export (${selectedList.length}) CSV`
+              : hasActiveFilters
+                ? 'Export Filtered CSV'
+                : 'Export CSV'}
+          </Button>
           <Button variant="primary" onClick={() => navigate('/upload')}>
             <Plus className="w-4 h-4" />
             Upload Invoice
           </Button>
         </div>
       </div>
+
+      {exportError && <ErrorBanner message={exportError} />}
 
       {/* Filter Bar */}
       <Card className="p-3.5">

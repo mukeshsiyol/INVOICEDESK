@@ -80,6 +80,13 @@ export function buildOpenApiSpec(serverOrigin: string) {
           responses: { '202': { description: 'Accepted fixture invoice and run ID' } },
         },
       },
+      '/invoices/precheck-duplicates': {
+        post: {
+          tags: ['Ingestion'],
+          summary: 'Inspect staged PDFs against existing invoices and batch peers for duplicate vendor, invoice number, date, or SHA-256 before upload',
+          responses: { '200': { description: 'Per-file duplicate and redundancy precheck results' } },
+        },
+      },
       '/invoices': {
         get: {
           tags: ['Invoices'],
@@ -90,7 +97,17 @@ export function buildOpenApiSpec(serverOrigin: string) {
       '/invoices/export': {
         get: {
           tags: ['Invoices'],
-          summary: 'Export filtered or selected invoices as CSV',
+          summary: 'Export filtered, sorted, or selected invoice list as CSV',
+          parameters: [
+            { name: 'ids', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'q', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'decision', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'processing_status', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'review_status', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'vendor_id', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'window', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'sort', in: 'query', required: false, schema: { type: 'string' } },
+          ],
           responses: { '200': { description: 'CSV file download' } },
         },
       },
@@ -135,6 +152,14 @@ export function buildOpenApiSpec(serverOrigin: string) {
           summary: 'Submit human APPROVE_OVERRIDE or REJECT_OVERRIDE with mandatory justification note (REVIEWER/ADMIN)',
           parameters: [{ name: 'invoiceId', in: 'path', required: true, schema: { type: 'string' } }],
           responses: { '200': { description: 'Review action persisted and PO debited if approved' } },
+        },
+      },
+      '/invoices/{invoiceId}/rejection-draft': {
+        post: {
+          tags: ['Invoices'],
+          summary: 'Generate grounded Gemini AI rejection explanation and editable vendor rejection email draft',
+          parameters: [{ name: 'invoiceId', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '200': { description: 'Generated rejection explanation and email draft' } },
         },
       },
       '/runs': {
@@ -183,6 +208,34 @@ export function buildOpenApiSpec(serverOrigin: string) {
           responses: { '201': { description: 'Created vendor' } },
         },
       },
+      '/vendors/report': {
+        get: {
+          tags: ['Procurement'],
+          summary: 'Compute per-vendor spend, PO utilization, and exception metrics',
+          responses: { '200': { description: 'Vendor report summary rows' } },
+        },
+      },
+      '/vendors/export': {
+        get: {
+          tags: ['Procurement'],
+          summary: 'Export vendor spend, PO utilization, and exception report as CSV',
+          parameters: [
+            { name: 'q', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'status', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'vendor_id', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'window', in: 'query', required: false, schema: { type: 'string' } },
+          ],
+          responses: { '200': { description: 'CSV vendor report download' } },
+        },
+      },
+      '/vendors/{vendorId}/export': {
+        get: {
+          tags: ['Procurement'],
+          summary: 'Export single-vendor PO and invoice ledger report as CSV',
+          parameters: [{ name: 'vendorId', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '200': { description: 'Single-vendor CSV report download' } },
+        },
+      },
       '/analytics/overview': {
         get: {
           tags: ['Analytics'],
@@ -211,6 +264,35 @@ export function buildOpenApiSpec(serverOrigin: string) {
           responses: { '200': { description: 'CSV download' } },
         },
       },
+      '/notifications': {
+        get: {
+          tags: ['Audit & Settings'],
+          summary: 'List workspace alerts for invoice uploads, manual reviews, and failures',
+          responses: { '200': { description: 'Notification feed and unread counts' } },
+        },
+      },
+      '/notifications/stream': {
+        get: {
+          tags: ['Audit & Settings'],
+          summary: 'Real-time Server-Sent Events (SSE) stream of workspace notifications with Last-Event-ID replay',
+          responses: { '200': { description: 'text/event-stream' } },
+        },
+      },
+      '/notifications/{notificationId}/read': {
+        post: {
+          tags: ['Audit & Settings'],
+          summary: 'Mark a workspace notification as read for the active user',
+          parameters: [{ name: 'notificationId', in: 'path', required: true, schema: { type: 'integer' } }],
+          responses: { '200': { description: 'Marked as read' } },
+        },
+      },
+      '/notifications/read-all': {
+        post: {
+          tags: ['Audit & Settings'],
+          summary: 'Mark all workspace notifications as read for the active user',
+          responses: { '200': { description: 'All notifications marked read' } },
+        },
+      },
       '/settings': {
         get: {
           tags: ['Audit & Settings'],
@@ -221,6 +303,13 @@ export function buildOpenApiSpec(serverOrigin: string) {
           tags: ['Audit & Settings'],
           summary: 'Update tolerance, OCR, and confidence policies (ADMIN)',
           responses: { '200': { description: 'Updated' } },
+        },
+      },
+      '/demo/reset': {
+        post: {
+          tags: ['Audit & Settings'],
+          summary: 'Restore clean demo baseline (3 seeded invoices and pristine PO balances)',
+          responses: { '200': { description: 'Demo baseline restored' } },
         },
       },
     },

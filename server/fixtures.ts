@@ -6,6 +6,10 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { hashPassword } from './auth.ts';
 import { config } from './config.ts';
 import { getDb, isoNow } from './db.ts';
+import {
+  DEFAULT_REJECTION_BODY_TEMPLATE,
+  DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+} from '../src/lib/rejectionTemplate.ts';
 
 // Minimal crisp 5x7 bitmap font for generating genuine image-only scanned PDFs (Edge Case E1)
 const FONT_5X7: Record<string, string[]> = {
@@ -486,9 +490,9 @@ export async function seedInitialDatabase(): Promise<void> {
   ).run(operatorId, 'operator@invoicedesk.io', 'Maya Lin', defaultPass, 'OPERATOR', now, now);
 
   db.prepare(
-    `INSERT INTO application_settings (id, workspace_name, default_currency, max_upload_mb, ocr_min_chars_per_page, force_ocr, tolerance_pct, tolerance_abs, tolerance_mode, confidence_threshold, auto_approve_max_amount, updated_by, updated_at)
-     VALUES (1, 'InvoiceDesk', 'USD', 25, 50, 0, '2.00', '10.0000', 'MIN_OF_PCT_AND_ABS', '0.850', '25000.0000', ?, ?)`
-  ).run(adminId, now);
+    `INSERT INTO application_settings (id, workspace_name, default_currency, max_upload_mb, ocr_min_chars_per_page, force_ocr, tolerance_pct, tolerance_abs, tolerance_mode, confidence_threshold, auto_approve_max_amount, rejection_email_subject_template, rejection_email_body_template, updated_by, updated_at)
+     VALUES (1, 'InvoiceDesk', 'USD', 25, 50, 0, '2.00', '10.0000', 'MIN_OF_PCT_AND_ABS', '0.850', '25000.0000', ?, ?, ?, ?)`
+  ).run(DEFAULT_REJECTION_SUBJECT_TEMPLATE, DEFAULT_REJECTION_BODY_TEMPLATE, adminId, now);
 
   // Vendors V-001 .. V-005
   const vendors = [
@@ -834,4 +838,46 @@ export async function seedInitialDatabase(): Promise<void> {
     poApplied: 0,
     daysAgo: 1,
   });
+
+  const seededReviewTs = new Date(Date.now() - 86400_000).toISOString();
+  db.prepare(
+    `INSERT INTO notifications (event_type, severity, title, message, invoice_id, run_id, metadata_json, created_at)
+     VALUES ('MANUAL_REVIEW_REQUIRED', 'WARNING', 'Manual Review Required', ?, 'inv-seed-003', 'run-seed-003', ?, ?)`
+  ).run(
+    'SDS-2026-099 (Summit Design Studio) · USD 3850.00 routed for human review (TOLERANCE_EXCEEDED).',
+    JSON.stringify({ primary_reason_code: 'TOLERANCE_EXCEEDED', total_amount: '3850.00', currency: 'USD' }),
+    seededReviewTs
+  );
 }
+
+export async function resetDemoDatabase(): Promise<void> {
+  const db = getDb();
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.exec(`
+      DELETE FROM notification_reads;
+      DELETE FROM notifications;
+      DELETE FROM review_actions;
+      DELETE FROM audit_logs;
+      DELETE FROM stage_events;
+      DELETE FROM decisions;
+      DELETE FROM invoice_lines;
+      DELETE FROM processing_runs;
+      DELETE FROM invoices;
+      DELETE FROM purchase_order_lines;
+      DELETE FROM purchase_orders;
+      DELETE FROM vendors;
+      DELETE FROM application_settings;
+      DELETE FROM users;
+    `);
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+
+  await fs.rm(config.storageDir, { recursive: true, force: true });
+  await fs.mkdir(config.storageDir, { recursive: true });
+  await seedInitialDatabase();
+}
+

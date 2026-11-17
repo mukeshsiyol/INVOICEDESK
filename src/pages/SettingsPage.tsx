@@ -1,15 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Bell,
   CheckCircle2,
   Cpu,
   ExternalLink,
+  Eye,
   Gauge,
   Lock,
+  Mail,
   Monitor,
   Moon,
   Plus,
+  RotateCcw,
   Save,
   ShieldCheck,
   Sliders,
@@ -19,6 +22,13 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { useTheme, type ThemeMode } from '../context/ThemeContext';
 import { apiFetch, formatDateTime, type UserRole } from '../lib/api';
+import {
+  buildSampleRejectionContext,
+  DEFAULT_REJECTION_BODY_TEMPLATE,
+  DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+  REJECTION_PLACEHOLDER_TOKENS,
+  renderRejectionTemplate,
+} from '../lib/rejectionTemplate';
 import { Button, Card, ErrorBanner, Modal } from '../components/ui/Primitives';
 
 type SettingsTab =
@@ -26,6 +36,7 @@ type SettingsTab =
   | 'processing'
   | 'rules'
   | 'confidence'
+  | 'templates'
   | 'notifications'
   | 'users'
   | 'appearance';
@@ -39,6 +50,10 @@ export function SettingsPage() {
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [templatePreviewOpen, setTemplatePreviewOpen] = useState(false);
+  const [activeTemplateField, setActiveTemplateField] = useState<'subject' | 'body'>('body');
+  const subjectTemplateRef = useRef<HTMLInputElement | null>(null);
+  const bodyTemplateRef = useRef<HTMLTextAreaElement | null>(null);
 
   const [form, setForm] = useState({
     workspace_name: 'InvoiceDesk',
@@ -50,8 +65,11 @@ export function SettingsPage() {
     tolerance_mode: 'MIN',
     confidence_threshold: '0.80',
     auto_approve_max_amount: '25000.00',
+    notify_on_upload: true,
     notify_on_review: true,
     notify_on_failure: true,
+    rejection_email_subject_template: DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+    rejection_email_body_template: DEFAULT_REJECTION_BODY_TEMPLATE,
   });
 
   const [addUserOpen, setAddUserOpen] = useState(false);
@@ -88,11 +106,47 @@ export function SettingsPage() {
           settingsData.auto_approve_max_amount != null
             ? String(Number(settingsData.auto_approve_max_amount).toFixed(2))
             : '',
+        notify_on_upload: settingsData.notify_on_upload !== 0,
         notify_on_review: Boolean(settingsData.notify_on_review),
         notify_on_failure: Boolean(settingsData.notify_on_failure),
+        rejection_email_subject_template:
+          settingsData.rejection_email_subject_template || DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+        rejection_email_body_template:
+          settingsData.rejection_email_body_template || DEFAULT_REJECTION_BODY_TEMPLATE,
       });
     }
   }, [settingsData]);
+
+  const insertPlaceholderIntoTemplate = (token: string) => {
+    if (!isAdmin) return;
+    if (activeTemplateField === 'subject') {
+      const el = subjectTemplateRef.current;
+      const cur = form.rejection_email_subject_template;
+      const start = el?.selectionStart ?? cur.length;
+      const end = el?.selectionEnd ?? cur.length;
+      const next = cur.slice(0, start) + token + cur.slice(end);
+      setForm((prev) => ({ ...prev, rejection_email_subject_template: next }));
+      window.requestAnimationFrame(() => {
+        if (el) {
+          el.focus();
+          el.setSelectionRange(start + token.length, start + token.length);
+        }
+      });
+      return;
+    }
+    const el = bodyTemplateRef.current;
+    const cur = form.rejection_email_body_template;
+    const start = el?.selectionStart ?? cur.length;
+    const end = el?.selectionEnd ?? cur.length;
+    const next = cur.slice(0, start) + token + cur.slice(end);
+    setForm((prev) => ({ ...prev, rejection_email_body_template: next }));
+    window.requestAnimationFrame(() => {
+      if (el) {
+        el.focus();
+        el.setSelectionRange(start + token.length, start + token.length);
+      }
+    });
+  };
 
   const saveSettings = useMutation({
     mutationFn: () =>
@@ -107,6 +161,7 @@ export function SettingsPage() {
       setErrorMsg(null);
       setSavedMsg('Workspace settings updated and logged to the Audit Trail.');
       void queryClient.invalidateQueries({ queryKey: ['settings'] });
+      void queryClient.invalidateQueries({ queryKey: ['notifications'] });
     },
     onError: (err: any) => {
       setSavedMsg(null);
@@ -124,6 +179,22 @@ export function SettingsPage() {
       setTheme(nextTheme);
       setSavedMsg(`Appearance preference saved (${nextTheme}).`);
       void refreshUser();
+    },
+  });
+
+  const resetDemo = useMutation({
+    mutationFn: () =>
+      apiFetch<{ ok: boolean; message: string }>('/demo/reset', {
+        method: 'POST',
+      }),
+    onSuccess: (res) => {
+      setErrorMsg(null);
+      setSavedMsg(res.message || 'Demo baseline restored cleanly.');
+      void queryClient.invalidateQueries();
+    },
+    onError: (err: any) => {
+      setSavedMsg(null);
+      setErrorMsg(err?.message || 'Failed to reset demo baseline.');
     },
   });
 
@@ -160,6 +231,7 @@ export function SettingsPage() {
     { id: 'processing', label: 'Processing & OCR', icon: Cpu },
     { id: 'rules', label: 'Approval Rules & Tolerance', icon: ShieldCheck },
     { id: 'confidence', label: 'Confidence Threshold', icon: Gauge },
+    { id: 'templates', label: 'Email Templates', icon: Mail },
     { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'users', label: 'Security & Users', icon: Users, adminOnly: true },
     { id: 'appearance', label: 'Appearance', icon: Sun },
@@ -273,6 +345,28 @@ export function SettingsPage() {
                         </select>
                       </div>
                     </div>
+
+                    {(user?.demo_mode || isAdmin) && (
+                      <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                            Demo Baseline Maintenance
+                          </div>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Restore the clean 3-invoice starting state and reset PO-104 / PO-205 / PO-300 balances before a live presentation.
+                          </p>
+                        </div>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          loading={resetDemo.isPending}
+                          onClick={() => resetDemo.mutate()}
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Reset Demo Baseline
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -464,6 +558,110 @@ export function SettingsPage() {
                   </div>
                 )}
 
+                {activeTab === 'templates' && (
+                  <div className="space-y-5">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                          Rejection Email Template Editor
+                        </h2>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Customize the default vendor rejection email template and placeholders used when generating AI rejection notices
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => setTemplatePreviewOpen(true)}
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          Preview
+                        </Button>
+                        {isAdmin && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() =>
+                              setForm((prev) => ({
+                                ...prev,
+                                rejection_email_subject_template: DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+                                rejection_email_body_template: DEFAULT_REJECTION_BODY_TEMPLATE,
+                              }))
+                            }
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Reset Default
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 space-y-2">
+                      <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                        Available Placeholders{' '}
+                        <span className="font-normal text-slate-500">
+                          (click to insert into {activeTemplateField === 'subject' ? 'Subject' : 'Email Body'})
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {REJECTION_PLACEHOLDER_TOKENS.map((item) => (
+                          <button
+                            key={item.token}
+                            type="button"
+                            disabled={!isAdmin}
+                            title={item.description}
+                            onClick={() => insertPlaceholderIntoTemplate(item.token)}
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-mono text-blue-700 dark:text-blue-300 hover:border-blue-400 disabled:opacity-50 cursor-pointer"
+                          >
+                            {item.token}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                          Subject Template
+                        </label>
+                        <input
+                          ref={subjectTemplateRef}
+                          type="text"
+                          disabled={!isAdmin}
+                          maxLength={300}
+                          onFocus={() => setActiveTemplateField('subject')}
+                          value={form.rejection_email_subject_template}
+                          onChange={(e) =>
+                            setForm({ ...form, rejection_email_subject_template: e.target.value })
+                          }
+                          className={`${inputClass} font-mono text-xs`}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                          Email Body Template
+                        </label>
+                        <textarea
+                          ref={bodyTemplateRef}
+                          rows={11}
+                          disabled={!isAdmin}
+                          maxLength={4000}
+                          onFocus={() => setActiveTemplateField('body')}
+                          value={form.rejection_email_body_template}
+                          onChange={(e) =>
+                            setForm({ ...form, rejection_email_body_template: e.target.value })
+                          }
+                          className="w-full p-3 text-xs font-mono leading-relaxed rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {activeTab === 'notifications' && (
                   <div className="space-y-4">
                     <div>
@@ -471,10 +669,27 @@ export function SettingsPage() {
                         Operational Alerts
                       </h2>
                       <p className="text-xs text-slate-500 mt-0.5">
-                        Controls which pipeline exceptions surface in the topbar notification tray
+                        Controls which workspace events surface in real-time alert toasts and the topbar notification tray
                       </p>
                     </div>
                     <div className="space-y-3">
+                      <label className="flex items-start gap-3">
+                        <input
+                          type="checkbox"
+                          disabled={!isAdmin}
+                          checked={form.notify_on_upload}
+                          onChange={(e) => setForm({ ...form, notify_on_upload: e.target.checked })}
+                          className="mt-1 h-4 w-4 rounded border-slate-300 text-blue-600"
+                        />
+                        <div>
+                          <div className="text-sm font-medium text-slate-800 dark:text-slate-200">
+                            Alert on new invoice uploads
+                          </div>
+                          <div className="text-xs text-slate-500">
+                            Broadcast real-time workspace notifications whenever a new invoice PDF is ingested.
+                          </div>
+                        </div>
+                      </label>
                       <label className="flex items-start gap-3">
                         <input
                           type="checkbox"
@@ -488,7 +703,7 @@ export function SettingsPage() {
                             Alert on pending human review
                           </div>
                           <div className="text-xs text-slate-500">
-                            Surface invoices routed to REVIEW in the notification indicator.
+                            Surface invoices routed to REVIEW in real-time toasts and the notification tray.
                           </div>
                         </div>
                       </label>
@@ -703,6 +918,60 @@ export function SettingsPage() {
             </Button>
           </div>
         </form>
+      </Modal>
+
+      <Modal
+        open={templatePreviewOpen}
+        onClose={() => setTemplatePreviewOpen(false)}
+        title="Rejection Email Template Preview (Sample Data)"
+      >
+        {(() => {
+          const sampleCtx = buildSampleRejectionContext(form.workspace_name);
+          const renderedSubj = renderRejectionTemplate(
+            form.rejection_email_subject_template,
+            sampleCtx
+          );
+          const renderedBody = renderRejectionTemplate(
+            form.rejection_email_body_template,
+            sampleCtx
+          );
+          const unresolved = Array.from(
+            new Set([...renderedSubj.unresolvedTokens, ...renderedBody.unresolvedTokens])
+          );
+          return (
+            <div className="space-y-4">
+              {unresolved.length > 0 && (
+                <div className="p-2.5 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-800 dark:text-amber-200">
+                  Unrecognized placeholders: <span className="font-mono">{unresolved.join(', ')}</span>
+                </div>
+              )}
+              <div className="rounded-md border border-slate-200 dark:border-slate-800 overflow-hidden">
+                <div className="px-3.5 py-2.5 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 space-y-1 text-xs">
+                  <div>
+                    <span className="text-slate-500">To:</span>{' '}
+                    <span className="font-medium text-slate-900 dark:text-slate-100">
+                      {sampleCtx.vendorName} Billing Team
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Subject:</span>{' '}
+                    <span className="font-semibold text-slate-900 dark:text-slate-100">
+                      {renderedSubj.rendered}
+                    </span>
+                  </div>
+                </div>
+                <div className="p-3.5 bg-white dark:bg-slate-900 text-xs text-slate-800 dark:text-slate-200 whitespace-pre-wrap leading-relaxed max-h-[360px] overflow-y-auto">
+                  {renderedBody.rendered}
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <Button variant="secondary" onClick={() => setTemplatePreviewOpen(false)}>
+                  Close Preview
+                </Button>
+              </div>
+            </div>
+          );
+        })()}
       </Modal>
     </div>
   );

@@ -20,9 +20,26 @@ import {
 import { config } from './config.ts';
 import { getDb, isoNow } from './db.ts';
 import { normalizeDocNumber, normalizeVendorName } from './engine.ts';
-import { persistValidatedPdf, readStoredPdf, validatePdfBuffer } from './extraction.ts';
-import { DEMO_FIXTURES } from './fixtures.ts';
+import {
+  GeminiConfigurationError,
+  extractQuickInvoiceSignals,
+  generateRejectionNoticeDraft,
+  persistValidatedPdf,
+  readStoredPdf,
+  validatePdfBuffer,
+  type RejectionNoticeTone,
+} from './extraction.ts';
+import { DEMO_FIXTURES, resetDemoDatabase } from './fixtures.ts';
 import { buildOpenApiSpec } from './openapi.ts';
+import {
+  createWorkspaceNotification,
+  listMissedNotificationsSince,
+  listNotificationsForUser,
+  markAllNotificationsRead,
+  markNotificationRead,
+  notificationBroker,
+  type NotificationStreamPayload,
+} from './notifications.ts';
 import { sseBroker, startProcessingRun, type SseEventPayload } from './pipeline.ts';
 
 const upload = multer({
@@ -57,6 +74,196 @@ function csvEscape(val: unknown): string {
     return `"${s.replace(/"/g, '""')}"`;
   }
   return s;
+}
+
+function windowStartIso(windowParam: string): string | null {
+  const now = Date.now();
+  if (windowParam === '7d') return new Date(now - 7 * 86400_000).toISOString();
+  if (windowParam === '30d') return new Date(now - 30 * 86400_000).toISOString();
+  if (windowParam === '90d') return new Date(now - 90 * 86400_000).toISOString();
+  return null;
+}
+
+function buildInvoiceFilterQuery(query: Request['query'], idsParam: string[] = []) {
+  const q = String(query.q ?? '').trim().toLowerCase();
+  const decision = String(query.decision ?? '').trim();
+  const procStatus = String(query.processing_status ?? '').trim();
+  const reviewStatus = String(query.review_status ?? '').trim();
+  const vendorId = String(query.vendor_id ?? '').trim();
+  const win = String(query.window ?? '').trim();
+  const attention = query.attention === 'true';
+  const sortParam = String(query.sort ?? '-created_at');
+
+  const where: string[] = ['1=1'];
+  const params: any[] = [];
+
+  if (idsParam.length > 0) {
+    where.push(`i.id IN (${idsParam.map(() => '?').join(',')})`);
+    params.push(...idsParam);
+  } else {
+    if (q) {
+      where.push(
+        `(LOWER(COALESCE(i.invoice_number,'')) LIKE ? OR LOWER(i.original_filename) LIKE ? OR LOWER(COALESCE(i.extracted_vendor_name,'')) LIKE ? OR LOWER(COALESCE(v.canonical_name,'')) LIKE ? OR LOWER(COALESCE(po.po_number,'')) LIKE ? OR LOWER(COALESCE(i.extracted_po_number,'')) LIKE ?)`
+      );
+      const like = `%${q}%`;
+      params.push(like, like, like, like, like, like);
+    }
+    if (decision && decision !== 'ALL') {
+      where.push('i.business_decision = ?');
+      params.push(decision);
+    }
+    if (procStatus && procStatus !== 'ALL') {
+      where.push('i.processing_status = ?');
+      params.push(procStatus);
+    }
+    if (reviewStatus && reviewStatus !== 'ALL') {
+      where.push('i.review_status = ?');
+      params.push(reviewStatus);
+    }
+    if (vendorId && vendorId !== 'ALL') {
+      where.push('i.vendor_id = ?');
+      params.push(vendorId);
+    }
+    if (win && win !== 'all') {
+      const startIso = windowStartIso(win);
+      if (startIso) {
+        where.push('i.created_at >= ?');
+        params.push(startIso);
+      }
+    }
+    if (attention) {
+      where.push(`(i.review_status = 'PENDING_REVIEW' OR i.processing_status = 'FAILED')`);
+    }
+  }
+
+  const sortMap: Record<string, string> = {
+    '-created_at': 'i.created_at DESC',
+    created_at: 'i.created_at ASC',
+    '-total_amount': 'CAST(COALESCE(i.total_amount, 0) AS REAL) DESC',
+    total_amount: 'CAST(COALESCE(i.total_amount, 0) AS REAL) ASC',
+    '-overall_confidence': 'COALESCE(i.overall_confidence, 0) DESC',
+  };
+  const orderBy = sortMap[sortParam] ?? 'i.created_at DESC';
+
+  return { whereSql: where.join(' AND '), params, orderBy };
+}
+
+function buildVendorReportRows(
+  db: ReturnType<typeof getDb>,
+  opts: { q?: string; status?: string; vendorId?: string; window?: string }
+) {
+  const q = String(opts.q ?? '').trim().toLowerCase();
+  const status = String(opts.status ?? '').trim();
+  const vendorId = String(opts.vendorId ?? '').trim();
+  const win = String(opts.window ?? 'all').trim();
+  const startIso = win && win !== 'all' ? windowStartIso(win) : null;
+
+  const vendors = (db.prepare('SELECT * FROM vendors ORDER BY vendor_code ASC').all() as any[])
+    .map((v) => ({
+      ...v,
+      aliases: JSON.parse(v.aliases || '[]') as string[],
+    }))
+    .filter((v) => {
+      if (vendorId && vendorId !== 'ALL' && v.id !== vendorId) return false;
+      if (status && status !== 'ALL' && v.verification_status !== status) return false;
+      if (!q) return true;
+      return (
+        v.canonical_name.toLowerCase().includes(q) ||
+        v.vendor_code.toLowerCase().includes(q) ||
+        (v.tax_id || '').toLowerCase().includes(q) ||
+        v.aliases.some((a: string) => a.toLowerCase().includes(q))
+      );
+    });
+
+  const allPos = db
+    .prepare('SELECT id, vendor_id, currency, original_amount, consumed_amount, status FROM purchase_orders')
+    .all() as any[];
+
+  const invSql = startIso
+    ? 'SELECT id, vendor_id, total_amount, overall_confidence, processing_status, business_decision, review_status, invoice_date, created_at FROM invoices WHERE created_at >= ?'
+    : 'SELECT id, vendor_id, total_amount, overall_confidence, processing_status, business_decision, review_status, invoice_date, created_at FROM invoices';
+  const allInvoices = (startIso ? db.prepare(invSql).all(startIso) : db.prepare(invSql).all()) as any[];
+
+  return vendors.map((v) => {
+    const vendorPos = allPos.filter((p) => p.vendor_id === v.id);
+    const activePos = vendorPos.filter((p) => p.status !== 'CANCELLED');
+    const openPoCount = vendorPos.filter((p) => ['OPEN', 'PARTIALLY_CONSUMED'].includes(p.status)).length;
+
+    let poCommitted = new Decimal(0);
+    let poConsumed = new Decimal(0);
+    for (const po of activePos) {
+      poCommitted = poCommitted.plus(po.original_amount || '0');
+      poConsumed = poConsumed.plus(po.consumed_amount || '0');
+    }
+    const poRemaining = Decimal.max(new Decimal(0), poCommitted.minus(poConsumed));
+    const poUtilPct = poCommitted.gt(0) ? poConsumed.div(poCommitted).mul(100).toFixed(1) : '0.0';
+
+    const vendorInvoices = allInvoices.filter((i) => i.vendor_id === v.id);
+    const decided = vendorInvoices.filter((i) => ['APPROVE', 'REVIEW', 'REJECT'].includes(i.business_decision));
+    const approvedCount = decided.filter((i) => i.business_decision === 'APPROVE').length;
+    const reviewCount = decided.filter((i) => i.business_decision === 'REVIEW').length;
+    const rejectedCount = decided.filter((i) => i.business_decision === 'REJECT').length;
+    const failedCount = vendorInvoices.filter((i) => i.processing_status === 'FAILED').length;
+    const exceptionRatePct =
+      decided.length > 0 ? (((reviewCount + rejectedCount) / decided.length) * 100).toFixed(1) : '0.0';
+
+    let totalInvoiced = new Decimal(0);
+    let approvedSpend = new Decimal(0);
+    const confs: number[] = [];
+    let lastInvoiceDate: string | null = null;
+
+    for (const inv of vendorInvoices) {
+      if (inv.total_amount && inv.processing_status === 'COMPLETED') {
+        try {
+          const amt = new Decimal(inv.total_amount);
+          totalInvoiced = totalInvoiced.plus(amt);
+          if (inv.business_decision === 'APPROVE' || inv.review_status === 'APPROVED_BY_HUMAN') {
+            approvedSpend = approvedSpend.plus(amt);
+          }
+        } catch {
+          // ignore malformed decimal
+        }
+      }
+      if (typeof inv.overall_confidence === 'number') {
+        confs.push(inv.overall_confidence);
+      }
+      const d = inv.invoice_date || inv.created_at;
+      if (d && (!lastInvoiceDate || String(d) > lastInvoiceDate)) {
+        lastInvoiceDate = String(d).slice(0, 10);
+      }
+    }
+
+    const meanConfPct =
+      confs.length > 0 ? ((confs.reduce((a, b) => a + b, 0) / confs.length) * 100).toFixed(1) : '';
+
+    return {
+      vendor_id: v.id,
+      vendor_code: v.vendor_code,
+      canonical_name: v.canonical_name,
+      tax_id: v.tax_id || '',
+      default_currency: v.default_currency || 'USD',
+      verification_status: v.verification_status,
+      payment_terms_days: v.payment_terms_days,
+      aliases: v.aliases.join('; '),
+      open_po_count: openPoCount,
+      total_po_count: vendorPos.length,
+      po_committed_amount: poCommitted.toFixed(2),
+      po_consumed_amount: poConsumed.toFixed(2),
+      po_remaining_amount: poRemaining.toFixed(2),
+      po_utilization_pct: poUtilPct,
+      total_invoices: vendorInvoices.length,
+      approved_invoices: approvedCount,
+      review_invoices: reviewCount,
+      rejected_invoices: rejectedCount,
+      failed_invoices: failedCount,
+      exception_rate_pct: exceptionRatePct,
+      total_invoiced_amount: totalInvoiced.toFixed(2),
+      approved_spend_amount: approvedSpend.toFixed(2),
+      mean_confidence_pct: meanConfPct,
+      last_invoice_date: lastInvoiceDate || '',
+      created_at: v.created_at,
+    };
+  });
 }
 
 async function ingestBufferAndQueueRun(params: {
@@ -110,6 +317,21 @@ async function ingestBufferAndQueueRun(params: {
     db.exec('ROLLBACK;');
     throw err;
   }
+
+  const uploaderRow = db
+    .prepare('SELECT full_name FROM users WHERE id = ?')
+    .get(params.userId) as { full_name: string } | undefined;
+
+  createWorkspaceNotification({
+    eventType: 'INVOICE_UPLOADED',
+    severity: 'INFO',
+    title: 'New Invoice Uploaded',
+    message: `${safeDisplayFilename} uploaded${uploaderRow?.full_name ? ` by ${uploaderRow.full_name}` : ''} and queued for verification.`,
+    invoiceId,
+    runId,
+    actorId: params.userId,
+    metadata: { filename: safeDisplayFilename, file_size_bytes: params.buffer.length },
+  });
 
   if (params.autoStart) {
     const p = startProcessingRun(runId);
@@ -297,6 +519,371 @@ export function createApiRouter(): express.Router {
   });
 
   router.post(
+    '/invoices/precheck-duplicates',
+    requireAuth,
+    (req, res, next) => {
+      upload.array('files', config.maxBatchFiles)(req, res, (err: any) => {
+        if (err) {
+          sendError(req, res, 400, 'PRECHECK_ERROR', err.message || 'Unable to inspect files for duplicates.');
+          return;
+        }
+        next();
+      });
+    },
+    async (req, res) => {
+      const files = (req.files as Express.Multer.File[]) || [];
+      let clientIds: string[] = [];
+      try {
+        const rawIds = req.body?.client_ids;
+        if (typeof rawIds === 'string') {
+          const parsed = JSON.parse(rawIds);
+          if (Array.isArray(parsed)) clientIds = parsed.map((v) => String(v));
+        }
+      } catch {
+        clientIds = [];
+      }
+
+      const db = getDb();
+      const vendorRows = db
+        .prepare('SELECT id, canonical_name, aliases FROM vendors')
+        .all() as Array<{ id: string; canonical_name: string; aliases: string }>;
+      const knownVendors = vendorRows.map((v) => {
+        let aliases: string[] = [];
+        try {
+          const parsed = JSON.parse(v.aliases || '[]');
+          if (Array.isArray(parsed)) aliases = parsed.map((a) => String(a));
+        } catch {
+          aliases = [];
+        }
+        return { id: v.id, canonical_name: v.canonical_name, aliases };
+      });
+
+      const existingInvoices = db
+        .prepare(
+          `SELECT i.id, i.original_filename, i.file_sha256, i.vendor_id, i.extracted_vendor_name,
+                  v.canonical_name AS vendor_canonical_name,
+                  i.invoice_number, i.normalized_invoice_number, i.invoice_date, i.total_amount,
+                  i.business_decision, i.created_at
+           FROM invoices i
+           LEFT JOIN vendors v ON v.id = i.vendor_id
+           WHERE i.processing_status = 'COMPLETED' AND i.business_decision != 'REJECT'
+           ORDER BY i.created_at ASC`
+        )
+        .all() as Array<{
+        id: string;
+        original_filename: string;
+        file_sha256: string;
+        vendor_id: string | null;
+        extracted_vendor_name: string | null;
+        vendor_canonical_name: string | null;
+        invoice_number: string | null;
+        normalized_invoice_number: string | null;
+        invoice_date: string | null;
+        total_amount: string | null;
+        business_decision: string;
+        created_at: string;
+      }>;
+
+      const vendorsMatch = (
+        vIdA: string | null,
+        vNameA: string | null,
+        vIdB: string | null,
+        vNameB: string | null
+      ) => {
+        if (vIdA && vIdB && vIdA === vIdB) return true;
+        const nA = normalizeVendorName(vNameA);
+        const nB = normalizeVendorName(vNameB);
+        return Boolean(nA && nB && nA === nB);
+      };
+
+      const stagedPeers: Array<{
+        client_id: string;
+        filename: string;
+        sha256: string;
+        vendorId: string | null;
+        vendorName: string | null;
+        normInvNo: string | null;
+        invoiceNumber: string | null;
+        invoiceDate: string | null;
+        totalAmount: string | null;
+      }> = [];
+
+      const matches: Array<Record<string, unknown>> = [];
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const clientId = clientIds[i] || `file_${i}`;
+        const pdfCheck = validatePdfBuffer(file.buffer);
+        if (!pdfCheck.valid) {
+          matches.push({ client_id: clientId, is_duplicate: false, match_type: 'NONE', matched_fields: [] });
+          continue;
+        }
+
+        const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+        const signals = await extractQuickInvoiceSignals(file.buffer, file.originalname, knownVendors);
+        const normInv = normalizeDocNumber(signals.invoiceNumber);
+        const currDateMs = signals.invoiceDate ? Date.parse(signals.invoiceDate) : Number.NaN;
+
+        const extractedPreview = {
+          vendor_name: signals.vendorName,
+          invoice_number: signals.invoiceNumber,
+          invoice_date: signals.invoiceDate,
+          total_amount: signals.totalAmount,
+          has_native_text: signals.hasNativeText,
+        };
+
+        let foundMatch: Record<string, unknown> | null = null;
+
+        // 1. Exact binary SHA-256 match against existing invoices
+        const exactFile = existingInvoices.find((inv) => inv.file_sha256 === sha256);
+        if (exactFile) {
+          const matchedFields = ['FILE_SHA256'];
+          if (vendorsMatch(signals.vendorId, signals.vendorName, exactFile.vendor_id, exactFile.vendor_canonical_name ?? exactFile.extracted_vendor_name)) {
+            matchedFields.push('VENDOR');
+          }
+          if (normInv && exactFile.normalized_invoice_number === normInv) {
+            matchedFields.push('INVOICE_NUMBER');
+          }
+          if (signals.invoiceDate && exactFile.invoice_date === signals.invoiceDate) {
+            matchedFields.push('INVOICE_DATE');
+          }
+          foundMatch = {
+            client_id: clientId,
+            is_duplicate: true,
+            warning_severity: 'HIGH',
+            match_type: 'FILE_SHA256',
+            matched_fields: matchedFields,
+            reason: `Identical PDF file (SHA-256) already processed as '${exactFile.original_filename}' (${exactFile.invoice_number || 'Unnumbered'}).`,
+            extracted_preview: extractedPreview,
+            existing_invoice_id: exactFile.id,
+            existing_filename: exactFile.original_filename,
+            existing_invoice_number: exactFile.invoice_number,
+            existing_vendor_name: exactFile.vendor_canonical_name ?? exactFile.extracted_vendor_name,
+            existing_invoice_date: exactFile.invoice_date,
+            existing_decision: exactFile.business_decision,
+            batch_peer_filename: null,
+          };
+        }
+
+        // 2. Vendor + Normalized Invoice Number (+ optional Date) match
+        if (!foundMatch && normInv && (signals.vendorId || normalizeVendorName(signals.vendorName))) {
+          const bizDup = existingInvoices.find(
+            (inv) =>
+              inv.normalized_invoice_number === normInv &&
+              vendorsMatch(
+                signals.vendorId,
+                signals.vendorName,
+                inv.vendor_id,
+                inv.vendor_canonical_name ?? inv.extracted_vendor_name
+              )
+          );
+          if (bizDup) {
+            const matchedFields = ['VENDOR', 'INVOICE_NUMBER'];
+            const bDateMs = bizDup.invoice_date ? Date.parse(bizDup.invoice_date) : Number.NaN;
+            if (!Number.isNaN(currDateMs) && !Number.isNaN(bDateMs) && Math.abs(currDateMs - bDateMs) <= 3 * 86400_000) {
+              matchedFields.push('INVOICE_DATE');
+            }
+            const vendorDisplay = bizDup.vendor_canonical_name ?? bizDup.extracted_vendor_name ?? signals.vendorName ?? 'Vendor';
+            const datePart = bizDup.invoice_date ? ` dated ${bizDup.invoice_date}` : '';
+            foundMatch = {
+              client_id: clientId,
+              is_duplicate: true,
+              warning_severity: 'HIGH',
+              match_type: 'VENDOR_INVOICE_KEY',
+              matched_fields: matchedFields,
+              reason: `Matches existing ${vendorDisplay} invoice ${bizDup.invoice_number ?? signals.invoiceNumber}${datePart} (${bizDup.original_filename}).`,
+              extracted_preview: extractedPreview,
+              existing_invoice_id: bizDup.id,
+              existing_filename: bizDup.original_filename,
+              existing_invoice_number: bizDup.invoice_number,
+              existing_vendor_name: vendorDisplay,
+              existing_invoice_date: bizDup.invoice_date,
+              existing_decision: bizDup.business_decision,
+              batch_peer_filename: null,
+            };
+          }
+        }
+
+        // 3. Vendor + Date (±3 days) potential redundancy check
+        if (!foundMatch && !Number.isNaN(currDateMs) && (signals.vendorId || normalizeVendorName(signals.vendorName))) {
+          for (const cand of existingInvoices) {
+            if (
+              !vendorsMatch(
+                signals.vendorId,
+                signals.vendorName,
+                cand.vendor_id,
+                cand.vendor_canonical_name ?? cand.extracted_vendor_name
+              )
+            ) {
+              continue;
+            }
+            if (!cand.invoice_date) continue;
+            const cDateMs = Date.parse(cand.invoice_date);
+            if (Number.isNaN(cDateMs)) continue;
+            const diffDays = Math.abs(currDateMs - cDateMs) / 86400_000;
+            if (diffDays > 3) continue;
+
+            let amountClose = false;
+            if (signals.totalAmount && cand.total_amount) {
+              try {
+                const a = new Decimal(signals.totalAmount);
+                const b = new Decimal(cand.total_amount);
+                const maxAmt = Decimal.max(a.abs(), b.abs());
+                amountClose = maxAmt.gt(0) && a.minus(b).abs().div(maxAmt).lte('0.10');
+              } catch {
+                amountClose = false;
+              }
+            }
+
+            if (diffDays === 0 || amountClose) {
+              const matchedFields = ['VENDOR', 'INVOICE_DATE'];
+              if (amountClose && signals.totalAmount === cand.total_amount) matchedFields.push('AMOUNT');
+              const vendorDisplay = cand.vendor_canonical_name ?? cand.extracted_vendor_name ?? signals.vendorName ?? 'Vendor';
+              foundMatch = {
+                client_id: clientId,
+                is_duplicate: true,
+                warning_severity: diffDays === 0 ? 'HIGH' : 'MEDIUM',
+                match_type: 'VENDOR_DATE_REDUNDANCY',
+                matched_fields: matchedFields,
+                reason: `Potential redundancy: ${vendorDisplay} already has invoice ${cand.invoice_number || cand.original_filename} dated ${cand.invoice_date}${diffDays === 0 ? ' (same invoice date)' : ` (within ${Math.round(diffDays)} day(s))`}.`,
+                extracted_preview: extractedPreview,
+                existing_invoice_id: cand.id,
+                existing_filename: cand.original_filename,
+                existing_invoice_number: cand.invoice_number,
+                existing_vendor_name: vendorDisplay,
+                existing_invoice_date: cand.invoice_date,
+                existing_decision: cand.business_decision,
+                batch_peer_filename: null,
+              };
+              break;
+            }
+          }
+        }
+
+        // 4. Fallback: Invoice Number + Date match even if vendor alias was unrecognized
+        if (!foundMatch && normInv && signals.invoiceDate) {
+          const invDateDup = existingInvoices.find(
+            (inv) => inv.normalized_invoice_number === normInv && inv.invoice_date === signals.invoiceDate
+          );
+          if (invDateDup) {
+            const vendorDisplay = invDateDup.vendor_canonical_name ?? invDateDup.extracted_vendor_name;
+            foundMatch = {
+              client_id: clientId,
+              is_duplicate: true,
+              warning_severity: 'MEDIUM',
+              match_type: 'VENDOR_INVOICE_KEY',
+              matched_fields: ['INVOICE_NUMBER', 'INVOICE_DATE'],
+              reason: `Invoice number ${invDateDup.invoice_number ?? signals.invoiceNumber} dated ${signals.invoiceDate} already exists (${invDateDup.original_filename}).`,
+              extracted_preview: extractedPreview,
+              existing_invoice_id: invDateDup.id,
+              existing_filename: invDateDup.original_filename,
+              existing_invoice_number: invDateDup.invoice_number,
+              existing_vendor_name: vendorDisplay,
+              existing_invoice_date: invDateDup.invoice_date,
+              existing_decision: invDateDup.business_decision,
+              batch_peer_filename: null,
+            };
+          }
+        }
+
+        // 5. Intra-batch duplicate / redundancy check against earlier files in the same upload queue
+        if (!foundMatch) {
+          for (const peer of stagedPeers) {
+            if (peer.sha256 === sha256) {
+              foundMatch = {
+                client_id: clientId,
+                is_duplicate: true,
+                warning_severity: 'HIGH',
+                match_type: 'INTRA_BATCH_DUPLICATE',
+                matched_fields: ['FILE_SHA256'],
+                reason: `Identical PDF content to staged file '${peer.filename}' in this upload batch.`,
+                extracted_preview: extractedPreview,
+                existing_invoice_id: null,
+                existing_filename: peer.filename,
+                existing_invoice_number: peer.invoiceNumber,
+                existing_vendor_name: peer.vendorName,
+                existing_invoice_date: peer.invoiceDate,
+                existing_decision: null,
+                batch_peer_filename: peer.filename,
+              };
+              break;
+            }
+            const samePeerVendor = vendorsMatch(signals.vendorId, signals.vendorName, peer.vendorId, peer.vendorName);
+            if (samePeerVendor && normInv && peer.normInvNo && normInv === peer.normInvNo) {
+              const matchedFields = ['VENDOR', 'INVOICE_NUMBER'];
+              if (signals.invoiceDate && peer.invoiceDate && signals.invoiceDate === peer.invoiceDate) {
+                matchedFields.push('INVOICE_DATE');
+              }
+              foundMatch = {
+                client_id: clientId,
+                is_duplicate: true,
+                warning_severity: 'HIGH',
+                match_type: 'INTRA_BATCH_DUPLICATE',
+                matched_fields: matchedFields,
+                reason: `Duplicates staged file '${peer.filename}' in this batch (${signals.vendorName || 'same vendor'} · ${signals.invoiceNumber}).`,
+                extracted_preview: extractedPreview,
+                existing_invoice_id: null,
+                existing_filename: peer.filename,
+                existing_invoice_number: peer.invoiceNumber,
+                existing_vendor_name: peer.vendorName,
+                existing_invoice_date: peer.invoiceDate,
+                existing_decision: null,
+                batch_peer_filename: peer.filename,
+              };
+              break;
+            }
+            if (samePeerVendor && signals.invoiceDate && peer.invoiceDate && signals.invoiceDate === peer.invoiceDate) {
+              foundMatch = {
+                client_id: clientId,
+                is_duplicate: true,
+                warning_severity: 'MEDIUM',
+                match_type: 'INTRA_BATCH_DUPLICATE',
+                matched_fields: ['VENDOR', 'INVOICE_DATE'],
+                reason: `Same vendor and invoice date (${signals.invoiceDate}) as staged file '${peer.filename}' in this batch.`,
+                extracted_preview: extractedPreview,
+                existing_invoice_id: null,
+                existing_filename: peer.filename,
+                existing_invoice_number: peer.invoiceNumber,
+                existing_vendor_name: peer.vendorName,
+                existing_invoice_date: peer.invoiceDate,
+                existing_decision: null,
+                batch_peer_filename: peer.filename,
+              };
+              break;
+            }
+          }
+        }
+
+        stagedPeers.push({
+          client_id: clientId,
+          filename: file.originalname,
+          sha256,
+          vendorId: signals.vendorId,
+          vendorName: signals.vendorName,
+          normInvNo: normInv,
+          invoiceNumber: signals.invoiceNumber,
+          invoiceDate: signals.invoiceDate,
+          totalAmount: signals.totalAmount,
+        });
+
+        matches.push(
+          foundMatch ?? {
+            client_id: clientId,
+            is_duplicate: false,
+            warning_severity: null,
+            match_type: 'NONE',
+            matched_fields: [],
+            reason: null,
+            extracted_preview: extractedPreview,
+          }
+        );
+      }
+
+      res.json({ matches });
+    }
+  );
+
+  router.post(
     '/invoices/upload',
     requireAuth,
     (req, res, next) => {
@@ -374,50 +961,9 @@ export function createApiRouter(): express.Router {
   // ==================== INVOICES LIST, EXPORT, DETAIL, DOCUMENT ====================
   router.get('/invoices', requireAuth, (req, res) => {
     const db = getDb();
-    const q = String(req.query.q ?? '').trim().toLowerCase();
-    const decision = String(req.query.decision ?? '').trim();
-    const procStatus = String(req.query.processing_status ?? '').trim();
-    const reviewStatus = String(req.query.review_status ?? '').trim();
-    const attention = req.query.attention === 'true';
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 20)));
-    const sortParam = String(req.query.sort ?? '-created_at');
-
-    const where: string[] = ['1=1'];
-    const params: any[] = [];
-
-    if (q) {
-      where.push(
-        `(LOWER(COALESCE(i.invoice_number,'')) LIKE ? OR LOWER(i.original_filename) LIKE ? OR LOWER(COALESCE(i.extracted_vendor_name,'')) LIKE ? OR LOWER(COALESCE(v.canonical_name,'')) LIKE ? OR LOWER(COALESCE(po.po_number,'')) LIKE ? OR LOWER(COALESCE(i.extracted_po_number,'')) LIKE ?)`
-      );
-      const like = `%${q}%`;
-      params.push(like, like, like, like, like, like);
-    }
-    if (decision && decision !== 'ALL') {
-      where.push('i.business_decision = ?');
-      params.push(decision);
-    }
-    if (procStatus && procStatus !== 'ALL') {
-      where.push('i.processing_status = ?');
-      params.push(procStatus);
-    }
-    if (reviewStatus && reviewStatus !== 'ALL') {
-      where.push('i.review_status = ?');
-      params.push(reviewStatus);
-    }
-    if (attention) {
-      where.push(`(i.review_status = 'PENDING_REVIEW' OR i.processing_status = 'FAILED')`);
-    }
-
-    const sortMap: Record<string, string> = {
-      '-created_at': 'i.created_at DESC',
-      created_at: 'i.created_at ASC',
-      '-total_amount': 'CAST(COALESCE(i.total_amount, 0) AS REAL) DESC',
-      total_amount: 'CAST(COALESCE(i.total_amount, 0) AS REAL) ASC',
-      '-overall_confidence': 'COALESCE(i.overall_confidence, 0) DESC',
-    };
-    const orderBy = sortMap[sortParam] ?? 'i.created_at DESC';
-    const whereSql = where.join(' AND ');
+    const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query);
 
     const total = (
       db
@@ -453,43 +999,45 @@ export function createApiRouter(): express.Router {
   router.get('/invoices/export', requireAuth, (req, res) => {
     const db = getDb();
     const idsParam = req.query.ids ? String(req.query.ids).split(',').filter(Boolean) : [];
-    const rows = idsParam.length
-      ? (db
-          .prepare(
-            `SELECT i.id, i.invoice_number, i.original_filename, COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
-                    COALESCE(po.po_number, i.extracted_po_number) AS po_number, i.invoice_date, i.currency, i.total_amount,
-                    i.overall_confidence, i.processing_status, i.business_decision, d.primary_reason_code, i.review_status, i.created_at
-             FROM invoices i
-             LEFT JOIN vendors v ON v.id = i.vendor_id
-             LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
-             LEFT JOIN decisions d ON d.id = i.latest_decision_id
-             WHERE i.id IN (${idsParam.map(() => '?').join(',')})
-             ORDER BY i.created_at DESC`
-          )
-          .all(...idsParam) as any[])
-      : (db
-          .prepare(
-            `SELECT i.id, i.invoice_number, i.original_filename, COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
-                    COALESCE(po.po_number, i.extracted_po_number) AS po_number, i.invoice_date, i.currency, i.total_amount,
-                    i.overall_confidence, i.processing_status, i.business_decision, d.primary_reason_code, i.review_status, i.created_at
-             FROM invoices i
-             LEFT JOIN vendors v ON v.id = i.vendor_id
-             LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
-             LEFT JOIN decisions d ON d.id = i.latest_decision_id
-             ORDER BY i.created_at DESC`
-          )
-          .all() as any[]);
+    const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query, idsParam);
+
+    const rows = db
+      .prepare(
+        `SELECT i.id, i.invoice_number, i.document_type, i.original_filename,
+                COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
+                v.verification_status AS vendor_status,
+                COALESCE(po.po_number, i.extracted_po_number) AS po_number,
+                i.invoice_date, i.due_date, i.currency,
+                i.subtotal_amount, i.tax_amount, i.discount_amount, i.total_amount,
+                i.overall_confidence, r.extraction_mode, i.processing_status, i.business_decision,
+                d.primary_reason_code, i.review_status, i.created_at
+         FROM invoices i
+         LEFT JOIN vendors v ON v.id = i.vendor_id
+         LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
+         LEFT JOIN decisions d ON d.id = i.latest_decision_id
+         LEFT JOIN processing_runs r ON r.id = i.latest_run_id
+         WHERE ${whereSql}
+         ORDER BY ${orderBy}`
+      )
+      .all(...params) as any[];
 
     const headers = [
       'id',
       'invoice_number',
+      'document_type',
       'original_filename',
       'vendor_name',
+      'vendor_status',
       'po_number',
       'invoice_date',
+      'due_date',
       'currency',
+      'subtotal_amount',
+      'tax_amount',
+      'discount_amount',
       'total_amount',
       'overall_confidence',
+      'extraction_mode',
       'processing_status',
       'business_decision',
       'primary_reason_code',
@@ -1014,7 +1562,7 @@ export function createApiRouter(): express.Router {
     try {
       const inv = db
         .prepare(
-          `SELECT id, purchase_order_id, total_amount, po_consumed_applied, business_decision, review_status, latest_decision_id
+          `SELECT id, invoice_number, original_filename, purchase_order_id, total_amount, po_consumed_applied, business_decision, review_status, latest_decision_id
            FROM invoices WHERE id = ?`
         )
         .get(req.params.invoiceId) as any;
@@ -1083,6 +1631,17 @@ export function createApiRouter(): express.Router {
       });
 
       db.exec('COMMIT;');
+
+      createWorkspaceNotification({
+        eventType: 'REVIEW_RESOLVED',
+        severity: 'INFO',
+        title: action === 'APPROVE_OVERRIDE' ? 'Manual Review Approved' : 'Manual Review Rejected',
+        message: `${inv.invoice_number || inv.original_filename} resolved by ${req.user!.full_name} (${newReviewStatus}).`,
+        invoiceId: inv.id,
+        actorId: req.user!.id,
+        metadata: { action, review_status: newReviewStatus },
+      });
+
       res.json({
         ok: true,
         invoice_id: inv.id,
@@ -1093,6 +1652,179 @@ export function createApiRouter(): express.Router {
     } catch (err) {
       db.exec('ROLLBACK;');
       throw err;
+    }
+  });
+
+  router.post('/invoices/:invoiceId/rejection-draft', requireAuth, async (req, res) => {
+    const rawTone = String(req.body?.tone ?? 'formal').toLowerCase();
+    const tone: RejectionNoticeTone =
+      rawTone === 'collaborative' || rawTone === 'concise' ? rawTone : 'formal';
+    const customInstructions =
+      typeof req.body?.custom_instructions === 'string'
+        ? req.body.custom_instructions.trim().slice(0, 300)
+        : null;
+
+    const db = getDb();
+    const inv = db
+      .prepare(
+        `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.verification_status AS vendor_verification_status,
+                po.po_number AS matched_po_number
+         FROM invoices i
+         LEFT JOIN vendors v ON v.id = i.vendor_id
+         LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
+         WHERE i.id = ?`
+      )
+      .get(req.params.invoiceId) as any;
+
+    if (!inv || !inv.latest_decision_id) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Invoice or decision record not found.');
+      return;
+    }
+
+    const decisionRow = db
+      .prepare('SELECT * FROM decisions WHERE id = ?')
+      .get(inv.latest_decision_id) as any;
+
+    if (!decisionRow) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Decision record not found for this invoice.');
+      return;
+    }
+
+    const isEligible =
+      decisionRow.outcome === 'REJECT' ||
+      decisionRow.outcome === 'REVIEW' ||
+      inv.business_decision === 'REJECT' ||
+      inv.review_status === 'REJECTED_BY_HUMAN';
+
+    if (!isEligible) {
+      sendError(
+        req,
+        res,
+        409,
+        'INVALID_STATE',
+        'AI rejection explanations and vendor rejection emails are only available for rejected or exception-review invoices.'
+      );
+      return;
+    }
+
+    const latestRejectOverride = db
+      .prepare(
+        `SELECT ra.action, ra.note, ra.created_at, u.full_name AS reviewer_name, u.role AS reviewer_role
+         FROM review_actions ra
+         JOIN users u ON u.id = ra.reviewer_id
+         WHERE ra.invoice_id = ? AND ra.action IN ('REJECT_OVERRIDE', 'COMMENT')
+         ORDER BY ra.created_at DESC LIMIT 1`
+      )
+      .get(inv.id) as
+      | {
+          action: string;
+          note: string;
+          created_at: string;
+          reviewer_name: string;
+          reviewer_role: string;
+        }
+      | undefined;
+
+    const appSettings = db
+      .prepare(
+        'SELECT workspace_name, rejection_email_subject_template, rejection_email_body_template FROM application_settings WHERE id = 1'
+      )
+      .get() as
+      | {
+          workspace_name: string;
+          rejection_email_subject_template?: string;
+          rejection_email_body_template?: string;
+        }
+      | undefined;
+
+    const subjectTemplate =
+      typeof req.body?.subject_template === 'string' && req.body.subject_template.trim()
+        ? req.body.subject_template.trim().slice(0, 300)
+        : appSettings?.rejection_email_subject_template || null;
+    const bodyTemplate =
+      typeof req.body?.body_template === 'string' && req.body.body_template.trim()
+        ? req.body.body_template.trim().slice(0, 4000)
+        : appSettings?.rejection_email_body_template || null;
+
+    const triggeredRules = JSON.parse(decisionRow.triggered_rules || '[]');
+    const evidenceSnapshot = JSON.parse(decisionRow.evidence_snapshot || '{}');
+
+    try {
+      const draft = await generateRejectionNoticeDraft({
+        workspaceName: appSettings?.workspace_name || 'InvoiceDesk',
+        tone,
+        customInstructions,
+        subjectTemplate,
+        bodyTemplate,
+        invoice: {
+          id: inv.id,
+          invoice_number: inv.invoice_number,
+          original_filename: inv.original_filename,
+          document_type: inv.document_type,
+          vendor_name: inv.vendor_canonical_name || inv.extracted_vendor_name || null,
+          vendor_status: inv.vendor_verification_status || null,
+          po_number: inv.matched_po_number || inv.extracted_po_number || null,
+          invoice_date: inv.invoice_date,
+          due_date: inv.due_date,
+          currency: inv.currency,
+          subtotal_amount: inv.subtotal_amount,
+          tax_amount: inv.tax_amount,
+          total_amount: inv.total_amount,
+          business_decision: inv.business_decision,
+          review_status: inv.review_status,
+        },
+        decision: {
+          outcome: decisionRow.outcome,
+          primary_reason_code: decisionRow.primary_reason_code,
+          explanation: decisionRow.explanation,
+          triggered_rules: triggeredRules,
+          evidence_snapshot: evidenceSnapshot,
+        },
+        humanReviewOverride: latestRejectOverride ?? null,
+      });
+
+      const updatedSnapshot = {
+        ...evidenceSnapshot,
+        ai_rejection_notice: draft,
+      };
+      db.prepare('UPDATE decisions SET evidence_snapshot = ? WHERE id = ?').run(
+        JSON.stringify(updatedSnapshot),
+        decisionRow.id
+      );
+
+      writeAuditLog({
+        actorId: req.user!.id,
+        actorType: 'USER',
+        actorRole: req.user!.role,
+        action: 'AI_REJECTION_DRAFT_GENERATED',
+        resourceType: 'INVOICE',
+        resourceId: inv.id,
+        originalDecision: decisionRow.outcome,
+        newDecision: inv.review_status === 'REJECTED_BY_HUMAN' ? 'REJECTED_BY_HUMAN' : decisionRow.outcome,
+        details: {
+          tone: draft.tone,
+          model: draft.generated_by_model,
+          decision_id: decisionRow.id,
+          has_custom_instructions: Boolean(customInstructions),
+        },
+      });
+
+      res.json({ draft });
+    } catch (err) {
+      if (err instanceof GeminiConfigurationError) {
+        sendError(req, res, 503, 'GEMINI_NOT_CONFIGURED', err.message);
+        return;
+      }
+      const message = err instanceof Error ? err.message : 'Unable to generate AI rejection draft.';
+      const status =
+        /\b403\b|PERMISSION_DENIED/i.test(message)
+          ? 403
+          : /\b429\b|RESOURCE_EXHAUSTED/i.test(message)
+            ? 429
+            : /\b400\b|API_KEY_INVALID/i.test(message)
+              ? 400
+              : 502;
+      sendError(req, res, status, 'GEMINI_GENERATION_FAILED', message);
     }
   });
 
@@ -1130,6 +1862,179 @@ export function createApiRouter(): express.Router {
       });
 
     res.json({ items, total: items.length });
+  });
+
+  router.get('/vendors/report', requireAuth, (req, res) => {
+    const db = getDb();
+    const items = buildVendorReportRows(db, {
+      q: String(req.query.q ?? ''),
+      status: String(req.query.status ?? ''),
+      vendorId: String(req.query.vendor_id ?? ''),
+      window: String(req.query.window ?? 'all'),
+    });
+    res.json({ items, total: items.length });
+  });
+
+  router.get('/vendors/export', requireAuth, (req, res) => {
+    const db = getDb();
+    const rows = buildVendorReportRows(db, {
+      q: String(req.query.q ?? ''),
+      status: String(req.query.status ?? ''),
+      vendorId: String(req.query.vendor_id ?? ''),
+      window: String(req.query.window ?? 'all'),
+    });
+
+    const headers = [
+      'vendor_id',
+      'vendor_code',
+      'canonical_name',
+      'tax_id',
+      'default_currency',
+      'verification_status',
+      'payment_terms_days',
+      'aliases',
+      'open_po_count',
+      'total_po_count',
+      'po_committed_amount',
+      'po_consumed_amount',
+      'po_remaining_amount',
+      'po_utilization_pct',
+      'total_invoices',
+      'approved_invoices',
+      'review_invoices',
+      'rejected_invoices',
+      'failed_invoices',
+      'exception_rate_pct',
+      'total_invoiced_amount',
+      'approved_spend_amount',
+      'mean_confidence_pct',
+      'last_invoice_date',
+      'created_at',
+    ];
+    const csv = [
+      headers.join(','),
+      ...rows.map((r: any) => headers.map((h) => csvEscape(r[h])).join(',')),
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="invoicedesk_vendor_report_${isoNow().slice(0, 10)}.csv"`
+    );
+    res.send(csv);
+  });
+
+  router.get('/vendors/:vendorId/export', requireAuth, (req, res) => {
+    const db = getDb();
+    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
+    if (!vendor) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Vendor not found.');
+      return;
+    }
+
+    const summary = buildVendorReportRows(db, { vendorId: vendor.id })[0];
+    const purchaseOrders = db
+      .prepare('SELECT * FROM purchase_orders WHERE vendor_id = ? ORDER BY issued_date DESC')
+      .all(vendor.id) as any[];
+    const invoices = db
+      .prepare(
+        `SELECT i.id, i.invoice_number, i.original_filename, i.invoice_date, i.currency, i.total_amount,
+                i.overall_confidence, i.processing_status, i.business_decision, i.review_status,
+                i.created_at, d.primary_reason_code, po.po_number AS matched_po_number
+         FROM invoices i
+         LEFT JOIN decisions d ON d.id = i.latest_decision_id
+         LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
+         WHERE i.vendor_id = ?
+         ORDER BY i.created_at DESC`
+      )
+      .all(vendor.id) as any[];
+
+    const headers = [
+      'record_type',
+      'vendor_code',
+      'vendor_name',
+      'reference_id',
+      'reference_number',
+      'date',
+      'status',
+      'decision',
+      'reason_code',
+      'currency',
+      'amount',
+      'secondary_amount',
+      'utilization_or_confidence_pct',
+      'notes_or_filename',
+    ];
+
+    const records: Array<Record<string, unknown>> = [
+      {
+        record_type: 'VENDOR_SUMMARY',
+        vendor_code: vendor.vendor_code,
+        vendor_name: vendor.canonical_name,
+        reference_id: vendor.id,
+        reference_number: vendor.tax_id || '',
+        date: summary?.last_invoice_date || '',
+        status: vendor.verification_status,
+        decision: `${summary?.approved_invoices ?? 0} APPROVED / ${summary?.review_invoices ?? 0} REVIEW / ${summary?.rejected_invoices ?? 0} REJECT`,
+        reason_code: `EXCEPTION_RATE_${summary?.exception_rate_pct ?? '0.0'}%`,
+        currency: vendor.default_currency,
+        amount: summary?.total_invoiced_amount ?? '0.00',
+        secondary_amount: summary?.po_consumed_amount ?? '0.00',
+        utilization_or_confidence_pct: summary?.po_utilization_pct ?? '0.0',
+        notes_or_filename: `Aliases: ${summary?.aliases || 'None'}`,
+      },
+      ...purchaseOrders.map((po) => {
+        const orig = new Decimal(po.original_amount);
+        const cons = new Decimal(po.consumed_amount);
+        const util = orig.gt(0) ? cons.div(orig).mul(100).toFixed(1) : '0.0';
+        return {
+          record_type: 'PURCHASE_ORDER',
+          vendor_code: vendor.vendor_code,
+          vendor_name: vendor.canonical_name,
+          reference_id: po.id,
+          reference_number: po.po_number,
+          date: po.issued_date,
+          status: po.status,
+          decision: '',
+          reason_code: '',
+          currency: po.currency,
+          amount: orig.toFixed(2),
+          secondary_amount: cons.toFixed(2),
+          utilization_or_confidence_pct: util,
+          notes_or_filename: po.notes || '',
+        };
+      }),
+      ...invoices.map((inv) => ({
+        record_type: 'INVOICE',
+        vendor_code: vendor.vendor_code,
+        vendor_name: vendor.canonical_name,
+        reference_id: inv.id,
+        reference_number: inv.invoice_number || inv.original_filename,
+        date: inv.invoice_date || String(inv.created_at).slice(0, 10),
+        status: inv.review_status !== 'NOT_REQUIRED' ? inv.review_status : inv.processing_status,
+        decision: inv.business_decision,
+        reason_code: inv.primary_reason_code || '',
+        currency: inv.currency || vendor.default_currency,
+        amount: inv.total_amount ?? '',
+        secondary_amount: inv.matched_po_number || '',
+        utilization_or_confidence_pct:
+          typeof inv.overall_confidence === 'number' ? (inv.overall_confidence * 100).toFixed(1) : '',
+        notes_or_filename: inv.original_filename,
+      })),
+    ];
+
+    const csv = [
+      headers.join(','),
+      ...records.map((r) => headers.map((h) => csvEscape(r[h])).join(',')),
+    ].join('\n');
+
+    const safeCode = String(vendor.vendor_code || vendor.id).replace(/[^A-Za-z0-9_-]/g, '_');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="invoicedesk_vendor_${safeCode}_${isoNow().slice(0, 10)}.csv"`
+    );
+    res.send(csv);
   });
 
   router.get('/vendors/:vendorId', requireAuth, (req, res) => {
@@ -1426,13 +2331,6 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== ANALYTICS & OVERVIEW ====================
-  function windowStartIso(windowParam: string): string | null {
-    const now = Date.now();
-    if (windowParam === '7d') return new Date(now - 7 * 86400_000).toISOString();
-    if (windowParam === '30d') return new Date(now - 30 * 86400_000).toISOString();
-    if (windowParam === '90d') return new Date(now - 90 * 86400_000).toISOString();
-    return null;
-  }
 
   router.get('/analytics/overview', requireAuth, (req, res) => {
     const db = getDb();
@@ -1648,64 +2546,205 @@ export function createApiRouter(): express.Router {
     res.json({ invoices, purchase_orders, vendors });
   });
 
-  router.get('/notifications', requireAuth, (_req, res) => {
-    const db = getDb();
-    const items = db
-      .prepare(
-        `SELECT i.id AS invoice_id, i.invoice_number, i.original_filename, i.processing_status, i.business_decision, i.review_status, i.updated_at,
-                d.primary_reason_code
-         FROM invoices i
-         LEFT JOIN decisions d ON d.id = i.latest_decision_id
-         WHERE i.review_status = 'PENDING_REVIEW' OR i.processing_status = 'FAILED'
-         ORDER BY i.updated_at DESC LIMIT 10`
-      )
-      .all();
-    res.json({ items, unread_count: items.length });
+  router.get('/notifications', requireAuth, (req, res) => {
+    const type = String(req.query.type ?? 'ALL');
+    const unreadOnly = req.query.unread_only === 'true';
+    const limit = Number(req.query.limit || 30);
+    const data = listNotificationsForUser(req.user!.id, { type, unreadOnly, limit });
+    res.json(data);
+  });
+
+  router.get('/notifications/stream', requireAuth, (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const lastEventIdHeader = req.header('Last-Event-ID') || String(req.query.lastEventId ?? '0');
+    let lastSentId = Number.parseInt(lastEventIdHeader, 10) || 0;
+
+    if (lastSentId > 0) {
+      const missed = listMissedNotificationsSince(lastSentId);
+      for (const item of missed) {
+        lastSentId = Math.max(lastSentId, item.id);
+        res.write(`id: ${item.id}\nevent: notification_created\ndata: ${JSON.stringify(item)}\n\n`);
+      }
+    }
+
+    const onNotification = (payload: NotificationStreamPayload) => {
+      if (payload.event === 'notification_created') {
+        if (payload.id <= lastSentId) return;
+        lastSentId = Math.max(lastSentId, payload.id);
+      }
+      res.write(`id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
+    };
+
+    const heartbeat = setInterval(() => {
+      res.write(': heartbeat\n\n');
+    }, 15000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      notificationBroker.off('workspace:notification', onNotification);
+    };
+
+    notificationBroker.on('workspace:notification', onNotification);
+    req.on('close', cleanup);
+  });
+
+  router.post('/notifications/:notificationId/read', requireAuth, (req, res) => {
+    const id = Number(req.params.notificationId);
+    if (!Number.isFinite(id) || id <= 0) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'Invalid notification ID.');
+      return;
+    }
+    markNotificationRead(req.user!.id, id);
+    res.json({ ok: true, id });
+  });
+
+  router.post('/notifications/read-all', requireAuth, (req, res) => {
+    const marked = markAllNotificationsRead(req.user!.id);
+    res.json({ ok: true, marked_count: marked });
   });
 
   // ==================== AUDIT TRAIL ====================
-  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+  function queryFilteredAuditLogs(params: { q: string; action: string; resourceType: string }) {
     const db = getDb();
-    const q = String(req.query.q ?? '').trim().toLowerCase();
-    const action = String(req.query.action ?? '').trim();
-    const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 30)));
-
     const rows = db
       .prepare(
-        `SELECT a.*, u.email AS actor_email, u.full_name AS actor_name
+        `SELECT a.*,
+                u.email AS actor_email,
+                u.full_name AS actor_name,
+                inv.invoice_number AS inv_number,
+                inv.original_filename AS inv_filename,
+                inv.extracted_vendor_name AS inv_vendor_name,
+                inv.total_amount AS inv_total_amount,
+                inv.currency AS inv_currency,
+                po.po_number AS po_number,
+                po.status AS po_status,
+                v.vendor_code AS vendor_code,
+                v.canonical_name AS vendor_name,
+                ru.email AS target_user_email,
+                ru.full_name AS target_user_name
          FROM audit_logs a
          LEFT JOIN users u ON u.id = a.actor_id
+         LEFT JOIN invoices inv ON a.resource_type = 'INVOICE' AND inv.id = a.resource_id
+         LEFT JOIN purchase_orders po ON a.resource_type = 'PURCHASE_ORDER' AND po.id = a.resource_id
+         LEFT JOIN vendors v ON a.resource_type = 'VENDOR' AND v.id = a.resource_id
+         LEFT JOIN users ru ON a.resource_type = 'USER' AND ru.id = a.resource_id
          ORDER BY a.id DESC`
       )
       .all() as any[];
 
-    const filtered = rows
-      .map((r) => ({ ...r, details: JSON.parse(r.details_json || '{}') }))
+    const qLower = params.q.trim().toLowerCase();
+    const actionFilter = params.action.trim();
+    const resTypeFilter = params.resourceType.trim();
+
+    return rows
+      .map((r) => {
+        let details: Record<string, unknown> = {};
+        try {
+          details = JSON.parse(r.details_json || '{}');
+        } catch {
+          details = {};
+        }
+
+        let resourceLabel = r.resource_id;
+        let resourceSublabel: string | null = null;
+        if (r.resource_type === 'INVOICE') {
+          resourceLabel = r.inv_number || r.inv_filename || (typeof details.filename === 'string' ? details.filename : r.resource_id);
+          resourceSublabel = r.inv_vendor_name || (r.inv_filename && r.inv_number ? r.inv_filename : null);
+        } else if (r.resource_type === 'PURCHASE_ORDER') {
+          resourceLabel = r.po_number || (typeof details.po_number === 'string' ? details.po_number : r.resource_id);
+          resourceSublabel = r.po_status ? `Status: ${r.po_status}` : null;
+        } else if (r.resource_type === 'VENDOR') {
+          resourceLabel = r.vendor_name || (typeof details.canonical_name === 'string' ? details.canonical_name : r.resource_id);
+          resourceSublabel = r.vendor_code || (typeof details.vendor_code === 'string' ? details.vendor_code : null);
+        } else if (r.resource_type === 'USER') {
+          resourceLabel = r.target_user_name || r.target_user_email || (typeof details.email === 'string' ? details.email : r.resource_id);
+          resourceSublabel = r.target_user_email || null;
+        } else if (r.resource_type === 'SETTINGS') {
+          resourceLabel = 'Workspace Policy Settings';
+          resourceSublabel = 'application_settings';
+        }
+
+        const eventHash = crypto
+          .createHash('sha256')
+          .update(
+            [
+              r.id,
+              r.created_at,
+              r.actor_id ?? '',
+              r.actor_type,
+              r.actor_role,
+              r.action,
+              r.resource_type,
+              r.resource_id,
+              r.original_decision ?? '',
+              r.new_decision ?? '',
+              r.details_json || '{}',
+            ].join('|')
+          )
+          .digest('hex');
+
+        const {
+          inv_number: _in,
+          inv_filename: _ifn,
+          inv_vendor_name: _ivn,
+          inv_total_amount: _ita,
+          inv_currency: _ic,
+          po_number: _pn,
+          po_status: _ps,
+          vendor_code: _vc,
+          vendor_name: _vn,
+          target_user_email: _tue,
+          target_user_name: _tun,
+          ...base
+        } = r;
+
+        return {
+          ...base,
+          details,
+          resource_label: resourceLabel,
+          resource_sublabel: resourceSublabel,
+          event_hash: eventHash,
+        };
+      })
       .filter((r) => {
-        if (action && action !== 'ALL' && r.action !== action) return false;
-        if (!q) return true;
+        if (actionFilter && actionFilter !== 'ALL' && r.action !== actionFilter) return false;
+        if (resTypeFilter && resTypeFilter !== 'ALL' && r.resource_type !== resTypeFilter) return false;
+        if (!qLower) return true;
         return (
-          r.action.toLowerCase().includes(q) ||
-          r.resource_id.toLowerCase().includes(q) ||
-          (r.actor_email || '').toLowerCase().includes(q) ||
-          JSON.stringify(r.details).toLowerCase().includes(q)
+          String(r.id) === qLower ||
+          r.action.toLowerCase().includes(qLower) ||
+          r.resource_id.toLowerCase().includes(qLower) ||
+          (r.resource_label || '').toLowerCase().includes(qLower) ||
+          (r.resource_sublabel || '').toLowerCase().includes(qLower) ||
+          (r.actor_email || '').toLowerCase().includes(qLower) ||
+          (r.actor_name || '').toLowerCase().includes(qLower) ||
+          JSON.stringify(r.details).toLowerCase().includes(qLower)
         );
       });
+  }
 
+  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+    const q = String(req.query.q ?? '');
+    const action = String(req.query.action ?? '');
+    const resourceType = String(req.query.resource_type ?? '');
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 30)));
+
+    const filtered = queryFilteredAuditLogs({ q, action, resourceType });
     const paged = filtered.slice((page - 1) * pageSize, page * pageSize);
     res.json({ items: paged, total: filtered.length, page, page_size: pageSize });
   });
 
-  router.get('/audit-logs/export', requireAuth, requireRoles('ADMIN'), (_req, res) => {
-    const db = getDb();
-    const rows = db
-      .prepare(
-        `SELECT a.id, a.created_at, a.actor_type, a.actor_role, COALESCE(u.email,'SYSTEM') AS actor_email,
-                a.action, a.resource_type, a.resource_id, a.original_decision, a.new_decision, a.details_json
-         FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id ORDER BY a.id DESC`
-      )
-      .all() as any[];
+  router.get('/audit-logs/export', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+    const q = String(req.query.q ?? '');
+    const action = String(req.query.action ?? '');
+    const resourceType = String(req.query.resource_type ?? '');
+    const rows = queryFilteredAuditLogs({ q, action, resourceType });
     const headers = [
       'id',
       'created_at',
@@ -1715,11 +2754,20 @@ export function createApiRouter(): express.Router {
       'action',
       'resource_type',
       'resource_id',
+      'resource_label',
       'original_decision',
       'new_decision',
+      'event_hash',
       'details_json',
     ];
-    const csv = [headers.join(','), ...rows.map((r) => headers.map((h) => csvEscape(r[h])).join(','))].join('\n');
+    const csv = [
+      headers.join(','),
+      ...rows.map((r) =>
+        headers
+          .map((h) => csvEscape(h === 'actor_email' ? r.actor_email || 'SYSTEM' : r[h]))
+          .join(',')
+      ),
+    ].join('\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="invoicedesk_audit_${isoNow().slice(0, 10)}.csv"`);
     res.send(csv);
@@ -1765,6 +2813,24 @@ export function createApiRouter(): express.Router {
           ? new Decimal(String(body.auto_approve_max_amount)).toFixed(4)
           : before.auto_approve_max_amount;
 
+    const nextSubjectTemplate =
+      body.rejection_email_subject_template !== undefined
+        ? String(body.rejection_email_subject_template).trim()
+        : before.rejection_email_subject_template;
+    const nextBodyTemplate =
+      body.rejection_email_body_template !== undefined
+        ? String(body.rejection_email_body_template).trim()
+        : before.rejection_email_body_template;
+
+    if (!nextSubjectTemplate || nextSubjectTemplate.length > 300) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'rejection_email_subject_template must be 1–300 characters.');
+      return;
+    }
+    if (!nextBodyTemplate || nextBodyTemplate.length > 4000) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'rejection_email_body_template must be 1–4000 characters.');
+      return;
+    }
+
     db.prepare(
       `UPDATE application_settings SET
         workspace_name = ?,
@@ -1776,8 +2842,11 @@ export function createApiRouter(): express.Router {
         tolerance_mode = ?,
         confidence_threshold = ?,
         auto_approve_max_amount = ?,
+        notify_on_upload = ?,
         notify_on_review = ?,
         notify_on_failure = ?,
+        rejection_email_subject_template = ?,
+        rejection_email_body_template = ?,
         updated_by = ?,
         updated_at = ?
        WHERE id = 1`
@@ -1791,8 +2860,11 @@ export function createApiRouter(): express.Router {
       body.tolerance_mode ?? before.tolerance_mode,
       confThresh.toFixed(3),
       autoCap,
+      body.notify_on_upload !== undefined ? (body.notify_on_upload ? 1 : 0) : (before.notify_on_upload ?? 1),
       body.notify_on_review !== undefined ? (body.notify_on_review ? 1 : 0) : before.notify_on_review,
       body.notify_on_failure !== undefined ? (body.notify_on_failure ? 1 : 0) : before.notify_on_failure,
+      nextSubjectTemplate,
+      nextBodyTemplate,
       req.user!.id,
       now
     );
@@ -1810,12 +2882,16 @@ export function createApiRouter(): express.Router {
           tolerance_abs: before.tolerance_abs,
           confidence_threshold: before.confidence_threshold,
           force_ocr: before.force_ocr,
+          rejection_email_template_changed:
+            nextSubjectTemplate !== before.rejection_email_subject_template ||
+            nextBodyTemplate !== before.rejection_email_body_template,
         },
         after: {
           tolerance_pct: tolPct.toFixed(2),
           tolerance_abs: tolAbs.toFixed(4),
           confidence_threshold: confThresh.toFixed(3),
           force_ocr: body.force_ocr ?? Boolean(before.force_ocr),
+          rejection_email_subject_template: nextSubjectTemplate,
         },
       },
     });
@@ -1901,6 +2977,18 @@ export function createApiRouter(): express.Router {
       details: { role: nextRole, is_active: Boolean(nextActive) },
     });
     res.json({ ok: true });
+  });
+
+  router.post('/demo/reset', requireAuth, async (req, res) => {
+    if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo && req.user?.role !== 'ADMIN') {
+      sendError(req, res, 403, 'FORBIDDEN', 'Demo reset is restricted to Administrators in production mode.');
+      return;
+    }
+    await resetDemoDatabase();
+    res.json({
+      ok: true,
+      message: 'Demo baseline restored (3 baseline invoices, pristine PO-104/205/300 balances).',
+    });
   });
 
   return router;

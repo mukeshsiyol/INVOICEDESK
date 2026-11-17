@@ -1,5 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { config } from './config.ts';
+import {
+  DEFAULT_REJECTION_BODY_TEMPLATE,
+  DEFAULT_REJECTION_SUBJECT_TEMPLATE,
+} from '../src/lib/rejectionTemplate.ts';
 
 let dbInstance: DatabaseSync | null = null;
 
@@ -209,12 +213,62 @@ function initSchema(db: DatabaseSync): void {
       tolerance_mode TEXT NOT NULL DEFAULT 'MIN_OF_PCT_AND_ABS',
       confidence_threshold TEXT NOT NULL DEFAULT '0.850',
       auto_approve_max_amount TEXT DEFAULT '25000.0000',
+      notify_on_upload INTEGER NOT NULL DEFAULT 1,
       notify_on_review INTEGER NOT NULL DEFAULT 1,
       notify_on_failure INTEGER NOT NULL DEFAULT 1,
+      rejection_email_subject_template TEXT NOT NULL DEFAULT '',
+      rejection_email_body_template TEXT NOT NULL DEFAULT '',
       updated_by TEXT REFERENCES users(id),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL CHECK (event_type IN ('INVOICE_UPLOADED', 'MANUAL_REVIEW_REQUIRED', 'PIPELINE_FAILED', 'REVIEW_RESOLVED')),
+      severity TEXT NOT NULL DEFAULT 'INFO' CHECK (severity IN ('INFO', 'WARNING', 'CRITICAL')),
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      invoice_id TEXT REFERENCES invoices(id) ON DELETE CASCADE,
+      run_id TEXT,
+      actor_id TEXT REFERENCES users(id),
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(id DESC);
+    CREATE INDEX IF NOT EXISTS idx_notifications_invoice ON notifications(invoice_id, id DESC);
+
+    CREATE TABLE IF NOT EXISTS notification_reads (
+      notification_id INTEGER NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      read_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (notification_id, user_id)
+    );
   `);
+
+  // Safe migration for existing SQLite databases
+  const cols = db.prepare('PRAGMA table_info(application_settings)').all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === 'notify_on_upload')) {
+    db.exec('ALTER TABLE application_settings ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 1;');
+  }
+  if (!cols.some((c) => c.name === 'rejection_email_subject_template')) {
+    db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_subject_template TEXT NOT NULL DEFAULT '';");
+  }
+  if (!cols.some((c) => c.name === 'rejection_email_body_template')) {
+    db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_body_template TEXT NOT NULL DEFAULT '';");
+  }
+
+  db.prepare(
+    `UPDATE application_settings
+     SET rejection_email_subject_template = CASE
+           WHEN COALESCE(TRIM(rejection_email_subject_template), '') = '' THEN ?
+           ELSE rejection_email_subject_template
+         END,
+         rejection_email_body_template = CASE
+           WHEN COALESCE(TRIM(rejection_email_body_template), '') = '' THEN ?
+           ELSE rejection_email_body_template
+         END
+     WHERE id = 1`
+  ).run(DEFAULT_REJECTION_SUBJECT_TEMPLATE, DEFAULT_REJECTION_BODY_TEMPLATE);
 }
 
 export function isoNow(): string {

@@ -2,13 +2,16 @@ import React, { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Bell,
   Building2,
+  CheckCheck,
   CheckCircle2,
   ChevronRight,
   ClipboardCheck,
   FileText,
+  FileUp,
   History,
   LayoutDashboard,
   LogOut,
@@ -23,11 +26,17 @@ import {
   Sun,
   UserCheck,
   X,
+  XCircle,
 } from 'lucide-react';
 import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { apiFetch, formatCurrency, type UserRole } from '../../lib/api';
+import {
+  useWorkspaceNotifications,
+  type NotificationEventType,
+  type WorkspaceNotificationItem,
+} from '../../hooks/useWorkspaceNotifications';
+import { apiFetch, formatCurrency, formatDateTime, type UserRole } from '../../lib/api';
 import { Button, DecisionBadge, Modal } from '../ui/Primitives';
 
 interface NavItem {
@@ -49,14 +58,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [notifOpen, setNotifOpen] = useState(false);
+  const [notifFilter, setNotifFilter] = useState<'ALL' | 'INVOICE_UPLOADED' | 'MANUAL_REVIEW_REQUIRED'>('ALL');
   const [profileOpen, setProfileOpen] = useState(false);
 
-  const { data: notifData } = useQuery({
-    queryKey: ['notifications'],
-    queryFn: () => apiFetch<{ items: any[]; unread_count: number }>('/notifications'),
-    refetchInterval: 15000,
-    enabled: Boolean(user),
-  });
+  const {
+    items: notifItems,
+    unreadCount,
+    pendingReviewCount,
+    toasts,
+    dismissToast,
+    markRead,
+    markAllRead,
+    markingAll,
+  } = useWorkspaceNotifications(user?.id, user?.role);
 
   const { data: searchResults } = useQuery({
     queryKey: ['global-search', searchQuery],
@@ -81,7 +95,39 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     setProfileOpen(false);
   }, [location.pathname]);
 
-  const pendingReviews = notifData?.items?.filter((n) => n.review_status === 'PENDING_REVIEW').length ?? 0;
+  const pendingReviews = pendingReviewCount;
+
+  const filteredNotifs = notifItems.filter((n) => {
+    if (notifFilter === 'ALL') return true;
+    if (notifFilter === 'MANUAL_REVIEW_REQUIRED') {
+      return n.event_type === 'MANUAL_REVIEW_REQUIRED' || n.event_type === 'PIPELINE_FAILED';
+    }
+    return n.event_type === notifFilter;
+  });
+
+  const renderNotifIcon = (eventType: NotificationEventType) => {
+    if (eventType === 'INVOICE_UPLOADED') {
+      return <FileUp className="w-4 h-4 text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />;
+    }
+    if (eventType === 'MANUAL_REVIEW_REQUIRED') {
+      return <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />;
+    }
+    if (eventType === 'PIPELINE_FAILED') {
+      return <XCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />;
+    }
+    return <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />;
+  };
+
+  const openNotificationTarget = (n: WorkspaceNotificationItem) => {
+    if (!n.is_read) markRead(n.id);
+    setNotifOpen(false);
+    dismissToast(n.id);
+    if (n.invoice_id) {
+      navigate(`/invoices/${n.invoice_id}`);
+    } else if (n.event_type === 'MANUAL_REVIEW_REQUIRED') {
+      navigate('/reviews');
+    }
+  };
 
   const navGroups: Array<{ title: string; items: NavItem[] }> = [
     {
@@ -305,45 +351,92 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 aria-label="Notifications"
               >
                 <Bell className="w-4 h-4" />
-                {(notifData?.unread_count ?? 0) > 0 && (
-                  <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-amber-500" />
+                {unreadCount > 0 && (
+                  <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-white font-mono text-[10px] font-bold flex items-center justify-center leading-none">
+                    {unreadCount > 9 ? '9+' : unreadCount}
+                  </span>
                 )}
               </button>
               {notifOpen && (
-                <div className="absolute right-0 mt-2 w-80 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-xl z-40 overflow-hidden">
-                  <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+                <div className="absolute right-0 mt-2 w-96 max-w-[calc(100vw-2rem)] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg shadow-xl z-40 overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
                     <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                      Attention Required ({notifData?.unread_count ?? 0})
+                      Workspace Alerts ({unreadCount} unread)
                     </span>
-                    <button
-                      onClick={() => setNotifOpen(false)}
-                      className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
-                    >
-                      Close
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {unreadCount > 0 && (
+                        <button
+                          onClick={() => markAllRead()}
+                          disabled={markingAll}
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                        >
+                          <CheckCheck className="w-3 h-3" />
+                          Mark all read
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setNotifOpen(false)}
+                        className="text-xs text-slate-400 hover:text-slate-600 cursor-pointer"
+                      >
+                        Close
+                      </button>
+                    </div>
                   </div>
-                  <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
-                    {!notifData?.items?.length ? (
-                      <div className="p-4 text-xs text-slate-500 text-center flex items-center justify-center gap-1.5">
+                  <div className="px-3 py-2 border-b border-slate-100 dark:border-slate-800 flex items-center gap-1.5 bg-slate-50/70 dark:bg-slate-950/40">
+                    {(
+                      [
+                        { id: 'ALL', label: 'All' },
+                        { id: 'INVOICE_UPLOADED', label: 'Uploads' },
+                        { id: 'MANUAL_REVIEW_REQUIRED', label: 'Needs Review' },
+                      ] as const
+                    ).map((tab) => (
+                      <button
+                        key={tab.id}
+                        onClick={() => setNotifFilter(tab.id)}
+                        className={`px-2 py-1 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                          notifFilter === tab.id
+                            ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs border border-slate-200 dark:border-slate-700'
+                            : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+                    {!filteredNotifs.length ? (
+                      <div className="p-6 text-xs text-slate-500 text-center flex items-center justify-center gap-1.5">
                         <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                        No pending exceptions or failures.
+                        No workspace alerts in this view.
                       </div>
                     ) : (
-                      notifData.items.map((n) => (
+                      filteredNotifs.map((n) => (
                         <button
-                          key={n.invoice_id}
-                          onClick={() => navigate(`/invoices/${n.invoice_id}`)}
-                          className="w-full text-left px-4 py-2.5 hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+                          key={n.id}
+                          onClick={() => openNotificationTarget(n)}
+                          className={`w-full text-left px-4 py-3 hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors cursor-pointer flex items-start gap-2.5 ${
+                            !n.is_read ? 'bg-blue-50/40 dark:bg-blue-950/20' : ''
+                          }`}
                         >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-xs font-medium text-slate-900 dark:text-slate-100 truncate">
-                              {n.invoice_number || n.original_filename}
-                            </span>
-                            <span className="text-[11px] font-mono text-amber-700 dark:text-amber-300 shrink-0">
-                              {n.processing_status === 'FAILED' ? 'FAILED' : n.primary_reason_code || 'REVIEW'}
-                            </span>
+                          {renderNotifIcon(n.event_type)}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                {n.title}
+                              </span>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <span className="text-[10px] font-mono text-slate-400">
+                                  {formatDateTime(n.created_at)}
+                                </span>
+                                {!n.is_read && (
+                                  <span className="w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" />
+                                )}
+                              </div>
+                            </div>
+                            <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 leading-snug">
+                              {n.message}
+                            </p>
                           </div>
-                          <div className="text-[11px] text-slate-500 mt-0.5 truncate">{n.original_filename}</div>
                         </button>
                       ))
                     )}
@@ -539,6 +632,68 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           )}
         </div>
       </Modal>
+
+      {/* Real-Time Workspace Alert Toasts */}
+      {toasts.length > 0 && (
+        <div
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 w-80 max-w-[calc(100vw-2rem)] pointer-events-none"
+        >
+          {toasts.map((t) => {
+            const borderTone =
+              t.severity === 'CRITICAL'
+                ? 'border-l-4 border-l-rose-500'
+                : t.severity === 'WARNING'
+                  ? 'border-l-4 border-l-amber-500'
+                  : 'border-l-4 border-l-blue-600';
+            return (
+              <div
+                key={t.id}
+                className={`pointer-events-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 ${borderTone} rounded-lg shadow-lg p-3.5 flex items-start gap-2.5`}
+              >
+                {renderNotifIcon(t.event_type)}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
+                      {t.title}
+                    </span>
+                    <button
+                      onClick={() => dismissToast(t.id)}
+                      aria-label="Dismiss alert"
+                      className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5 leading-snug">
+                    {t.message}
+                  </p>
+                  <div className="mt-2 flex items-center gap-3">
+                    <button
+                      onClick={() => openNotificationTarget(t)}
+                      className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                    >
+                      {t.event_type === 'MANUAL_REVIEW_REQUIRED' ? 'Inspect & Review →' : 'View Invoice →'}
+                    </button>
+                    {t.event_type === 'MANUAL_REVIEW_REQUIRED' && (
+                      <button
+                        onClick={() => {
+                          if (!t.is_read) markRead(t.id);
+                          dismissToast(t.id);
+                          navigate('/reviews');
+                        }}
+                        className="text-[11px] font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 cursor-pointer"
+                      >
+                        Review Queue
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

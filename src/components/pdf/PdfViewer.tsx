@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import {
@@ -7,6 +7,7 @@ import {
   Download,
   FileText,
   Loader2,
+  Maximize2,
   RotateCw,
   ZoomIn,
   ZoomOut,
@@ -26,10 +27,12 @@ export function PdfViewer({
   extractionMode?: string | null;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
-  const [scale, setScale] = useState(1.1);
+  const [fitMode, setFitMode] = useState<'fit' | 'manual'>('fit');
+  const [scale, setScale] = useState(0.85);
   const [rotation, setRotation] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -38,12 +41,29 @@ export function PdfViewer({
   const [ocrPages, setOcrPages] = useState<Array<{ page: number; text: string; ocr_confidence: number }>>([]);
   const [ocrLoading, setOcrLoading] = useState(false);
 
+  const computeFitScale = useCallback(async () => {
+    if (!pdfDoc || !viewportRef.current) return;
+    try {
+      const page = await pdfDoc.getPage(pageNum);
+      const baseViewport = page.getViewport({ scale: 1, rotation });
+      const containerWidth = viewportRef.current.clientWidth;
+      if (containerWidth <= 0 || baseViewport.width <= 0) return;
+      const availableWidth = Math.max(260, containerWidth - 36);
+      const widthScale = availableWidth / baseViewport.width;
+      const optimal = Math.min(0.95, Math.max(0.55, Number(widthScale.toFixed(2))));
+      setScale(optimal);
+    } catch {
+      // ignore page measurement errors while switching docs
+    }
+  }, [pdfDoc, pageNum, rotation]);
+
   useEffect(() => {
     let cancelled = false;
     let loadedDoc: pdfjsLib.PDFDocumentProxy | null = null;
     setLoading(true);
     setError(null);
     setPageNum(1);
+    setFitMode('fit');
 
     const load = async () => {
       try {
@@ -81,6 +101,19 @@ export function PdfViewer({
       if (loadedDoc) void (loadedDoc as unknown as { destroy?: () => Promise<void> }).destroy?.();
     };
   }, [invoiceId]);
+
+  useEffect(() => {
+    if (fitMode !== 'fit' || !pdfDoc) return;
+    void computeFitScale();
+
+    const container = viewportRef.current;
+    if (!container || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      void computeFitScale();
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [fitMode, pdfDoc, pageNum, rotation, computeFitScale]);
 
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
@@ -161,7 +194,10 @@ export function PdfViewer({
 
         <div className="flex items-center gap-1">
           <button
-            onClick={() => setScale((s) => Math.max(0.6, Number((s - 0.15).toFixed(2))))}
+            onClick={() => {
+              setFitMode('manual');
+              setScale((s) => Math.max(0.5, Number((s - 0.15).toFixed(2))));
+            }}
             className="p-1.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
             title="Zoom out"
           >
@@ -171,11 +207,29 @@ export function PdfViewer({
             {Math.round(scale * 100)}%
           </span>
           <button
-            onClick={() => setScale((s) => Math.min(2.0, Number((s + 0.15).toFixed(2))))}
+            onClick={() => {
+              setFitMode('manual');
+              setScale((s) => Math.min(2.2, Number((s + 0.15).toFixed(2))));
+            }}
             className="p-1.5 rounded hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
             title="Zoom in"
           >
             <ZoomIn className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => {
+              setFitMode('fit');
+              void computeFitScale();
+            }}
+            className={`inline-flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+              fitMode === 'fit'
+                ? 'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800'
+                : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+            title="Fit invoice width to pane"
+          >
+            <Maximize2 className="w-3 h-3" />
+            Fit
           </button>
           <button
             onClick={() => setRotation((r) => (r + 90) % 360)}
@@ -203,7 +257,7 @@ export function PdfViewer({
       </div>
 
       {/* Canvas Viewport */}
-      <div className="flex-1 overflow-auto p-4 flex justify-center items-start min-h-[460px]">
+      <div ref={viewportRef} className="flex-1 overflow-auto p-4 flex justify-center items-start min-h-[460px]">
         {loading ? (
           <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-sm gap-2">
             <Loader2 className="w-5 h-5 animate-spin" />
