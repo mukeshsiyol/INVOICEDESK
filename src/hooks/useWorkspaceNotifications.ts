@@ -112,9 +112,22 @@ export function useWorkspaceNotifications(userId: string | undefined, userRole?:
         });
 
         pushToast(item);
-        void queryClient.invalidateQueries({ queryKey: ['invoices'] });
-        void queryClient.invalidateQueries({ queryKey: ['reviews'] });
-        void queryClient.invalidateQueries({ queryKey: ['overview'] });
+        if (item.event_type === 'REVIEW_RESOLVED' && item.invoice_id) {
+          queryClient.setQueriesData<{ items: any[]; total: number }>(
+            { queryKey: ['reviews', 'PENDING_REVIEW'] },
+            (prev) => {
+              if (!prev?.items) return prev;
+              const nextItems = prev.items.filter((row) => row.id !== item.invoice_id);
+              return nextItems.length === prev.items.length
+                ? prev
+                : { ...prev, items: nextItems, total: Math.max(0, nextItems.length) };
+            }
+          );
+          void queryClient.invalidateQueries({ queryKey: ['invoice', item.invoice_id], refetchType: 'all' });
+        }
+        void queryClient.invalidateQueries({ queryKey: ['invoices'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['reviews'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['overview'], refetchType: 'all' });
       } catch {
         // ignore malformed SSE frame
       }

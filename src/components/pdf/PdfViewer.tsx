@@ -17,7 +17,7 @@ import { Button, Modal } from '../ui/Primitives';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
-export function PdfViewer({
+export const PdfViewer = React.memo(function PdfViewer({
   invoiceId,
   filename,
   extractionMode,
@@ -28,6 +28,7 @@ export function PdfViewer({
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const lastObservedSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
@@ -56,18 +57,19 @@ export function PdfViewer({
     try {
       const page = await pdfDoc.getPage(pageNum);
       const baseViewport = page.getViewport({ scale: 1, rotation });
-      const containerWidth = viewportRef.current.clientWidth;
-      const containerHeight = viewportRef.current.clientHeight;
+      const containerWidth = viewportRef.current.offsetWidth || viewportRef.current.clientWidth;
+      const containerHeight = viewportRef.current.offsetHeight || viewportRef.current.clientHeight;
       if (containerWidth <= 0 || baseViewport.width <= 0) return;
-      const availableWidth = Math.max(260, containerWidth - 36);
+      // Viewport uses p-4 pb-16 (32px horizontal, 80px vertical padding)
+      const availableWidth = Math.max(240, containerWidth - 40);
       const widthScale = availableWidth / baseViewport.width;
-      const availableHeight = containerHeight > 120 ? containerHeight - 36 : Infinity;
+      const availableHeight = containerHeight > 140 ? containerHeight - 92 : Infinity;
       const heightScale =
         Number.isFinite(availableHeight) && baseViewport.height > 0
           ? availableHeight / baseViewport.height
           : widthScale;
-      const optimal = Math.min(1.0, Math.max(0.45, Number(Math.min(widthScale, heightScale).toFixed(2))));
-      setScale(optimal);
+      const optimal = Math.min(1.0, Math.max(0.4, Number(Math.min(widthScale, heightScale).toFixed(2))));
+      setScale((prev) => (Math.abs(prev - optimal) < 0.01 ? prev : optimal));
     } catch {
       // ignore page measurement errors while switching docs
     }
@@ -122,15 +124,37 @@ export function PdfViewer({
 
   useEffect(() => {
     if (fitMode !== 'fit' || !pdfDoc) return;
+    const container = viewportRef.current;
+    if (!container) return;
+
+    lastObservedSizeRef.current = {
+      w: container.offsetWidth,
+      h: container.offsetHeight,
+    };
     void computeFitScale();
 
-    const container = viewportRef.current;
-    if (!container || typeof ResizeObserver === 'undefined') return;
+    if (typeof ResizeObserver === 'undefined') return;
+    let rafId = 0;
     const observer = new ResizeObserver(() => {
-      void computeFitScale();
+      const nextW = container.offsetWidth;
+      const nextH = container.offsetHeight;
+      if (
+        Math.abs(nextW - lastObservedSizeRef.current.w) < 4 &&
+        Math.abs(nextH - lastObservedSizeRef.current.h) < 4
+      ) {
+        return;
+      }
+      lastObservedSizeRef.current = { w: nextW, h: nextH };
+      if (rafId) window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        void computeFitScale();
+      });
     });
     observer.observe(container);
-    return () => observer.disconnect();
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      observer.disconnect();
+    };
   }, [fitMode, pdfDoc, pageNum, rotation, computeFitScale]);
 
   useEffect(() => {
@@ -170,7 +194,7 @@ export function PdfViewer({
   }, [ocrModalOpen, zoomIn, zoomOut, resetFitView]);
 
   useEffect(() => {
-    if (!pdfDoc || !canvasRef.current) return;
+    if (loading || !pdfDoc || !canvasRef.current) return;
     let renderTask: pdfjsLib.RenderTask | null = null;
     let cancelled = false;
 
@@ -179,18 +203,34 @@ export function PdfViewer({
         const page = await pdfDoc.getPage(pageNum);
         if (cancelled || !canvasRef.current) return;
         const viewport = page.getViewport({ scale, rotation });
-        const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
         const dpr = window.devicePixelRatio || 1;
-        canvas.width = Math.floor(viewport.width * dpr);
-        canvas.height = Math.floor(viewport.height * dpr);
-        canvas.style.width = `${Math.floor(viewport.width)}px`;
-        canvas.style.height = `${Math.floor(viewport.height)}px`;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const pixelWidth = Math.max(1, Math.floor(viewport.width * dpr));
+        const pixelHeight = Math.max(1, Math.floor(viewport.height * dpr));
+        const cssWidth = `${Math.floor(viewport.width)}px`;
+        const cssHeight = `${Math.floor(viewport.height)}px`;
 
-        renderTask = page.render({ canvasContext: ctx, viewport, canvas });
+        // Double-buffer onto an offscreen canvas so the visible canvas never flashes blank mid-render
+        const offscreen = document.createElement('canvas');
+        offscreen.width = pixelWidth;
+        offscreen.height = pixelHeight;
+        const offCtx = offscreen.getContext('2d');
+        if (!offCtx) return;
+        offCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        renderTask = page.render({ canvasContext: offCtx, viewport, canvas: offscreen });
         await renderTask.promise;
+        if (cancelled || !canvasRef.current) return;
+
+        const targetCanvas = canvasRef.current;
+        targetCanvas.width = pixelWidth;
+        targetCanvas.height = pixelHeight;
+        targetCanvas.style.width = cssWidth;
+        targetCanvas.style.height = cssHeight;
+        const targetCtx = targetCanvas.getContext('2d');
+        if (targetCtx) {
+          targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+          targetCtx.drawImage(offscreen, 0, 0);
+        }
       } catch (err: any) {
         if (err?.name !== 'RenderingCancelledException' && !cancelled) {
           setError('Failed to render PDF page.');
@@ -203,7 +243,7 @@ export function PdfViewer({
       cancelled = true;
       renderTask?.cancel();
     };
-  }, [pdfDoc, pageNum, scale, rotation]);
+  }, [pdfDoc, loading, pageNum, scale, rotation]);
 
   const openOcrInspect = async () => {
     setOcrModalOpen(true);
@@ -283,7 +323,9 @@ export function PdfViewer({
           ref={viewportRef}
           tabIndex={0}
           aria-label="Invoice PDF viewport"
-          className="flex-1 overflow-auto p-4 pb-16 flex justify-center items-start focus:outline-none"
+          className={`flex-1 p-4 pb-16 flex justify-center items-start focus:outline-none ${
+            fitMode === 'fit' ? 'overflow-hidden' : 'overflow-auto'
+          }`}
         >
           {loading ? (
             <div className="flex flex-col items-center justify-center py-20 text-slate-500 text-sm gap-2">
@@ -406,4 +448,4 @@ export function PdfViewer({
       </Modal>
     </div>
   );
-}
+});

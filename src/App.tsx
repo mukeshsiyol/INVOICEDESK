@@ -2,13 +2,14 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-import React from 'react';
+import React, { Profiler } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AppShell } from './components/layout/AppShell';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ThemeProvider } from './context/ThemeContext';
+import { handleProfilerRender } from './lib/renderProfiler';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { AuditTrailPage } from './pages/AuditTrailPage';
 import { InvoicesPage } from './pages/InvoicesPage';
@@ -51,22 +52,59 @@ function AuthenticatedApp() {
   }
 
   return (
-    <AppShell>
-      <Routes>
-        <Route path="/" element={<OverviewPage />} />
-        <Route path="/invoices" element={<InvoicesPage />} />
-        <Route path="/invoices/:invoiceId" element={<ProcessingWorkspacePage />} />
-        <Route path="/upload" element={<UploadPage />} />
-        <Route path="/reviews" element={<ReviewQueuePage />} />
-        <Route path="/runs" element={<RunsPage />} />
-        <Route path="/purchase-orders" element={<PurchaseOrdersPage />} />
-        <Route path="/vendors" element={<VendorsPage />} />
-        <Route path="/analytics" element={<AnalyticsPage />} />
-        <Route path="/audit" element={<AuditTrailPage />} />
-        <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </AppShell>
+    <Profiler id="CoreWorkspace" onRender={handleProfilerRender}>
+      <AppShell>
+        <Routes>
+          <Route path="/" element={<OverviewPage />} />
+          <Route
+            path="/invoices"
+            element={
+              <Profiler id="InvoicesLedger" onRender={handleProfilerRender}>
+                <InvoicesPage />
+              </Profiler>
+            }
+          />
+          <Route
+            path="/invoices/:invoiceId"
+            element={
+              <Profiler id="ProcessingWorkspace" onRender={handleProfilerRender}>
+                <ProcessingWorkspacePage />
+              </Profiler>
+            }
+          />
+          <Route
+            path="/upload"
+            element={
+              <Profiler id="InvoiceUpload" onRender={handleProfilerRender}>
+                <UploadPage />
+              </Profiler>
+            }
+          />
+          <Route
+            path="/reviews"
+            element={
+              <Profiler id="ReviewQueue" onRender={handleProfilerRender}>
+                <ReviewQueuePage />
+              </Profiler>
+            }
+          />
+          <Route
+            path="/runs"
+            element={
+              <Profiler id="PipelineRuns" onRender={handleProfilerRender}>
+                <RunsPage />
+              </Profiler>
+            }
+          />
+          <Route path="/purchase-orders" element={<PurchaseOrdersPage />} />
+          <Route path="/vendors" element={<VendorsPage />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/audit" element={<AuditTrailPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AppShell>
+    </Profiler>
   );
 }
 

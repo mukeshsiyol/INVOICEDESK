@@ -164,21 +164,47 @@ export function ProcessingWorkspacePage() {
 
   const reviewMutation = useMutation({
     mutationFn: (payload: { action: 'APPROVE_OVERRIDE' | 'REJECT_OVERRIDE'; note: string }) =>
-      apiFetch(`/invoices/${invoiceId}/review`, {
+      apiFetch<{ review_status?: string }>(`/invoices/${invoiceId}/review`, {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
-    onSuccess: () => {
+    onSuccess: (res) => {
       setReviewModal(null);
       setReviewNote('');
       setReviewError(null);
-      void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId] });
-      void queryClient.invalidateQueries({ queryKey: ['invoices'] });
-      void queryClient.invalidateQueries({ queryKey: ['reviews'] });
-      void queryClient.invalidateQueries({ queryKey: ['overview'] });
-      void queryClient.invalidateQueries({ queryKey: ['notifications'] });
+      if (res?.review_status) {
+        queryClient.setQueriesData<any>({ queryKey: ['invoice', invoiceId] }, (prev: any) =>
+          prev?.invoice
+            ? { ...prev, invoice: { ...prev.invoice, review_status: res.review_status } }
+            : prev
+        );
+      }
+      queryClient.setQueriesData<{ items: any[]; total: number }>(
+        { queryKey: ['reviews', 'PENDING_REVIEW'] },
+        (prev) => {
+          if (!prev?.items) return prev;
+          const nextItems = prev.items.filter((item) => item.id !== invoiceId);
+          return nextItems.length === prev.items.length
+            ? prev
+            : { ...prev, items: nextItems, total: Math.max(0, nextItems.length) };
+        }
+      );
+      queryClient.setQueryData<{ items: any[] }>(['invoices', 'attention'], (prev) => {
+        if (!prev?.items) return prev;
+        return { ...prev, items: prev.items.filter((item) => item.id !== invoiceId) };
+      });
+      void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId], refetchType: 'all' });
+      void queryClient.invalidateQueries({ queryKey: ['invoices'], refetchType: 'all' });
+      void queryClient.invalidateQueries({ queryKey: ['reviews'], refetchType: 'all' });
+      void queryClient.invalidateQueries({ queryKey: ['overview'], refetchType: 'all' });
+      void queryClient.invalidateQueries({ queryKey: ['notifications'], refetchType: 'all' });
     },
     onError: (err: any) => {
+      if (err?.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['reviews'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['invoices'], refetchType: 'all' });
+      }
       setReviewError(err?.message || 'Unable to submit review decision.');
     },
   });

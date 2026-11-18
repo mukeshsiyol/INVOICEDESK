@@ -4,7 +4,7 @@ import { CheckCircle2, ClipboardCheck, ExternalLink, UserCheck, UserX } from 'lu
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useRole } from '../hooks/useRole';
-import { apiFetch, formatCurrency, formatDateTime } from '../lib/api';
+import { ApiError, apiFetch, formatCurrency, formatDateTime } from '../lib/api';
 import {
   Button,
   Card,
@@ -23,7 +23,7 @@ export function ReviewQueuePage() {
 
   const [tab, setTab] = useState<'PENDING_REVIEW' | 'RESOLVED'>('PENDING_REVIEW');
   const [category, setCategory] = useState('ALL');
-  const [selected, setSelected] = useState<any | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [note, setNote] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -32,10 +32,29 @@ export function ReviewQueuePage() {
     queryFn: () => apiFetch<{ items: any[]; total: number }>(`/reviews?status=${tab}&category=${category}`),
   });
 
+  const selected = data?.items?.find((item) => item.id === selectedId) ?? null;
+
   const { data: settingsData } = useQuery({
     queryKey: ['settings'],
     queryFn: () => apiFetch<any>('/settings'),
   });
+
+  const removeFromPendingQueueCache = (invoiceId: string) => {
+    queryClient.setQueriesData<{ items: any[]; total: number }>(
+      { queryKey: ['reviews', 'PENDING_REVIEW'] },
+      (prev) => {
+        if (!prev?.items) return prev;
+        const nextItems = prev.items.filter((item) => item.id !== invoiceId);
+        return nextItems.length === prev.items.length
+          ? prev
+          : { ...prev, items: nextItems, total: Math.max(0, nextItems.length) };
+      }
+    );
+    queryClient.setQueryData<{ items: any[] }>(['invoices', 'attention'], (prev) => {
+      if (!prev?.items) return prev;
+      return { ...prev, items: prev.items.filter((item) => item.id !== invoiceId) };
+    });
+  };
 
   const decideMutation = useMutation({
     mutationFn: ({ invoiceId, action, reviewNote }: { invoiceId: string; action: string; reviewNote: string }) =>
@@ -43,16 +62,28 @@ export function ReviewQueuePage() {
         method: 'POST',
         body: JSON.stringify({ action, note: reviewNote }),
       }),
-    onSuccess: () => {
-      setSelected(null);
+    onSuccess: async (_res, variables) => {
+      setSelectedId(null);
       setNote('');
       setActionError(null);
-      void queryClient.invalidateQueries({ queryKey: ['reviews'] });
-      void queryClient.invalidateQueries({ queryKey: ['invoices'] });
-      void queryClient.invalidateQueries({ queryKey: ['overview'] });
-      void queryClient.invalidateQueries({ queryKey: ['notifications'] });
+      removeFromPendingQueueCache(variables.invoiceId);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['reviews'], refetchType: 'all' }),
+        queryClient.invalidateQueries({ queryKey: ['invoice', variables.invoiceId], refetchType: 'all' }),
+        queryClient.invalidateQueries({ queryKey: ['invoices'], refetchType: 'all' }),
+        queryClient.invalidateQueries({ queryKey: ['overview'], refetchType: 'all' }),
+        queryClient.invalidateQueries({ queryKey: ['notifications'], refetchType: 'all' }),
+      ]);
     },
-    onError: (err: any) => {
+    onError: (err: any, variables) => {
+      if (err instanceof ApiError && err.status === 409) {
+        removeFromPendingQueueCache(variables.invoiceId);
+        setSelectedId(null);
+        void queryClient.invalidateQueries({ queryKey: ['reviews'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['invoices'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['overview'], refetchType: 'all' });
+        void queryClient.invalidateQueries({ queryKey: ['notifications'], refetchType: 'all' });
+      }
       setActionError(err?.message || 'Unable to save review decision.');
     },
   });
@@ -73,7 +104,7 @@ export function ReviewQueuePage() {
           <button
             onClick={() => {
               setTab('PENDING_REVIEW');
-              setSelected(null);
+              setSelectedId(null);
             }}
             className={`px-3 py-1 text-xs font-medium rounded-md cursor-pointer ${
               tab === 'PENDING_REVIEW'
@@ -86,7 +117,7 @@ export function ReviewQueuePage() {
           <button
             onClick={() => {
               setTab('RESOLVED');
-              setSelected(null);
+              setSelectedId(null);
             }}
             className={`px-3 py-1 text-xs font-medium rounded-md cursor-pointer ${
               tab === 'RESOLVED'
@@ -145,7 +176,7 @@ export function ReviewQueuePage() {
                 <div
                   key={item.id}
                   onClick={() => {
-                    setSelected(item);
+                    setSelectedId(item.id);
                     setActionError(null);
                   }}
                   className={`p-4 flex items-center justify-between gap-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 cursor-pointer transition-colors ${

@@ -82,6 +82,7 @@ export async function apiFetch<T = any>(path: string, init?: RequestInit): Promi
 
   const res = await fetch(`/api/v1${path}`, {
     credentials: 'include',
+    cache: 'no-store',
     ...init,
     headers: {
       ...headers,
