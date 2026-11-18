@@ -121,6 +121,27 @@ export function ProcessingWorkspacePage() {
     isActive: Boolean(isRunActive),
   });
 
+  const autoStartedRunRef = useRef<string | null>(null);
+  const shouldAutoStart = searchParams.get('autoStart') === '1';
+
+  useEffect(() => {
+    if (!shouldAutoStart || !invoiceId || !activeRun?.id || activeRun.status !== 'QUEUED') return;
+    if (autoStartedRunRef.current === activeRun.id) return;
+    autoStartedRunRef.current = activeRun.id;
+
+    void apiFetch(`/invoices/${invoiceId}/start`, {
+      method: 'POST',
+      body: JSON.stringify({ if_queued: true }),
+    })
+      .catch(() => {})
+      .finally(() => {
+        void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId] });
+        void queryClient.invalidateQueries({ queryKey: ['invoices'] });
+        void queryClient.invalidateQueries({ queryKey: ['overview'] });
+        void queryClient.invalidateQueries({ queryKey: ['notifications'] });
+      });
+  }, [shouldAutoStart, invoiceId, activeRun?.id, activeRun?.status, queryClient]);
+
   // Merge persisted stage_events with live SSE stage events cleanly
   const mergedEventsByStage = useMemo(() => {
     const all = [...(data?.stage_events || []), ...liveEvents];
@@ -149,13 +170,18 @@ export function ProcessingWorkspacePage() {
 
   const retryMutation = useMutation({
     mutationFn: () =>
-      apiFetch<{ run_id: string }>(`/invoices/${invoiceId}/retry`, {
+      apiFetch<{ run_id: string; serverless_async?: boolean }>(`/invoices/${invoiceId}/retry`, {
         method: 'POST',
         body: JSON.stringify({ reason: 'Operator manual retry' }),
       }),
     onSuccess: (res) => {
       const next = new URLSearchParams(searchParams);
       next.set('runId', res.run_id);
+      if (res.serverless_async) {
+        next.set('autoStart', '1');
+      } else {
+        next.delete('autoStart');
+      }
       setSearchParams(next);
       void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId] });
       void queryClient.invalidateQueries({ queryKey: ['invoices'] });

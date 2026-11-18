@@ -213,7 +213,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     if (!pdfCheck.valid) {
       throw new Error(pdfCheck.reason || 'PDF validation failed.');
     }
-    const nativeInspection = await inspectPdfNativeText(pdfBuffer);
+    const nativeInspection = await inspectPdfNativeText(pdfBuffer, { maxPages: 25, timeoutMs: 8000 });
     db.prepare(`UPDATE invoices SET page_count = ?, updated_at = ? WHERE id = ?`).run(
       nativeInspection.pageCount,
       isoNow(),
@@ -251,7 +251,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         : `Extracting structured fields from native PDF text (${nativeInspection.avgCharsPerPage.toFixed(0)} chars/page)...`,
     });
 
-    const { payload: extracted, latencyMs, modelUsed } = await defaultExtractionProvider.extractInvoice({
+    const {
+      payload: extracted,
+      latencyMs,
+      modelUsed,
+      fallbackUsed,
+      fallbackReason,
+    } = await defaultExtractionProvider.extractInvoice({
       pdfBuffer,
       nativeInspection,
       extractionMode,
@@ -329,14 +335,18 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     persistAndEmitStageEvent({
       runId,
       stageNumber: 2,
-      status: 'COMPLETED',
+      status: fallbackUsed ? 'WARNING' : 'COMPLETED',
       durationMs: Date.now() - s2Start,
-      summary: `${extractionMode === 'OCR' ? 'OCR Vision fallback' : 'Native text'} extracted ${extracted.line_items.length} line item(s) · Mean confidence ${Math.round(overallConf * 100)}%`,
+      summary: fallbackUsed
+        ? `Deterministic native-text fallback extracted ${extracted.line_items.length} line item(s) after AI timeout · Mean confidence ${Math.round(overallConf * 100)}%`
+        : `${extractionMode === 'OCR' ? 'OCR Vision fallback' : 'Native text'} extracted ${extracted.line_items.length} line item(s) · Mean confidence ${Math.round(overallConf * 100)}%`,
       evidence: {
         extraction_mode: extractionMode,
         provider: `${defaultExtractionProvider.providerName}:${modelUsed}`,
         llm_latency_ms: latencyMs,
         overall_confidence: overallConf,
+        fallback_used: Boolean(fallbackUsed),
+        ...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
         extracted_fields_summary: {
           vendor: extracted.vendor.name,
           invoice_number: extracted.invoice_number,

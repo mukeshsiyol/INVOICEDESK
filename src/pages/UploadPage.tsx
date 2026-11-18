@@ -304,6 +304,7 @@ export function UploadPage() {
             {
               method: 'POST',
               body: formData,
+              signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(8000) : undefined,
             }
           );
           for (const m of res.matches || []) {
@@ -449,6 +450,7 @@ export function UploadPage() {
             {
               method: 'POST',
               body: formData,
+              signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal ? AbortSignal.timeout(25000) : undefined,
             }
           );
 
@@ -503,6 +505,23 @@ export function UploadPage() {
       void queryClient.invalidateQueries({ queryKey: ['overview'] });
       void queryClient.invalidateQueries({ queryKey: ['notifications'] });
 
+      const triggerServerlessRuns = async (entries: any[]) => {
+        const asyncTargets = entries.filter((e) => e?.serverless_async && e?.invoice_id);
+        const CONCURRENCY = 3;
+        for (let i = 0; i < asyncTargets.length; i += CONCURRENCY) {
+          const chunk = asyncTargets.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            chunk.map((entry) =>
+              apiFetch(`/invoices/${entry.invoice_id}/start`, {
+                method: 'POST',
+                body: JSON.stringify({ if_queued: true }),
+              })
+            )
+          );
+          void queryClient.invalidateQueries({ queryKey: ['invoices'] });
+        }
+      };
+
       if (
         validFiles.length === 1 &&
         totalAccepted === 1 &&
@@ -512,9 +531,14 @@ export function UploadPage() {
       ) {
         const onlyEntry = acceptedResultsByClientId.get(validFiles[0].clientId);
         if (onlyEntry?.invoice_id) {
-          navigate(`/invoices/${onlyEntry.invoice_id}?live=true`);
+          const autoParam = onlyEntry.serverless_async ? '&autoStart=1' : '';
+          navigate(`/invoices/${onlyEntry.invoice_id}?live=true${autoParam}`);
           return;
         }
+      }
+
+      if (autoStart) {
+        void triggerServerlessRuns(Array.from(acceptedResultsByClientId.values()));
       }
 
       setQueue((prev) =>
@@ -598,7 +622,8 @@ export function UploadPage() {
       void queryClient.invalidateQueries({ queryKey: ['overview'] });
       void queryClient.invalidateQueries({ queryKey: ['notifications'] });
       if (res.accepted?.[0]) {
-        navigate(`/invoices/${res.accepted[0].invoice_id}?live=true`);
+        const autoParam = res.accepted[0].serverless_async ? '&autoStart=1' : '';
+        navigate(`/invoices/${res.accepted[0].invoice_id}?live=true${autoParam}`);
       }
     } catch (err) {
       setGlobalError(err instanceof Error ? err.message : 'Unable to run sample fixture.');
@@ -635,8 +660,16 @@ export function UploadPage() {
           method: 'POST',
           body: JSON.stringify({ fixture_key: fx.key }),
         });
-        const invId = res.accepted?.[0]?.invoice_id;
+        const acceptedEntry = res.accepted?.[0];
+        const invId = acceptedEntry?.invoice_id;
         if (!invId) continue;
+
+        if (acceptedEntry.serverless_async) {
+          await apiFetch(`/invoices/${invId}/start`, {
+            method: 'POST',
+            body: JSON.stringify({ if_queued: true }),
+          }).catch(() => {});
+        }
 
         let finalDecision = 'PENDING';
         let finalReason: string | null = null;

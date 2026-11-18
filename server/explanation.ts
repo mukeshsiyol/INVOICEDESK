@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { config } from './config.ts';
 import { isoNow } from './db.ts';
@@ -180,7 +180,10 @@ export async function generateDecisionExplanation(input: ExplanationInput): Prom
   try {
     const client = new GoogleGenAI({
       apiKey: config.geminiApiKey,
-      httpOptions: { timeout: 15_000 },
+      httpOptions: {
+        timeout: 10_000,
+        headers: { 'User-Agent': 'aistudio-build' },
+      },
     });
     const explanationModel = config.geminiFallbackModel || config.geminiModel;
     const systemInstruction = [
@@ -216,15 +219,16 @@ export async function generateDecisionExplanation(input: ExplanationInput): Prom
               },
               required: ['decision_outcome', 'executive_summary', 'decision_explanation', 'recommended_actions'],
             } as any,
-            temperature: 0.1,
-            maxOutputTokens: 500,
-            abortSignal: AbortSignal.timeout(attempt === 0 ? 15_000 : 18_000),
+            ...(explanationModel.startsWith('gemini-4-')
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            abortSignal: AbortSignal.timeout(10_000),
           },
         });
         break;
       } catch (err) {
         if (attempt === 0 && isTransient(err)) {
-          await new Promise((resolve) => setTimeout(resolve, 600));
+          await new Promise((resolve) => setTimeout(resolve, 400));
           continue;
         }
         throw err;
@@ -252,4 +256,57 @@ export async function generateDecisionExplanation(input: ExplanationInput): Prom
 
 export function fallbackDecisionExplanation(input: ExplanationInput, reason: string): ExplanationResult {
   return deterministicFallback(input, reason);
+}
+
+export interface BuildExplanationRecordParams {
+  input: ExplanationInput;
+  aiExplanation?: {
+    explanation: string;
+    key_findings?: string[];
+    recommended_action?: string;
+    verification_checks?: string[];
+    suggested_po_number?: string | null;
+    generated_by_model?: string | null;
+    generated_at?: string;
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+  } | null;
+  fallbackReason?: string | null;
+}
+
+export function buildExplanationRecord(params: BuildExplanationRecordParams): ExplanationResult {
+  const { input, aiExplanation, fallbackReason } = params;
+  if (!aiExplanation) {
+    return deterministicFallback(
+      input,
+      fallbackReason || 'Deterministic rule engine explanation.'
+    );
+  }
+
+  const result = buildBase(input, 'GEMINI', null);
+  const actions = [
+    aiExplanation.recommended_action,
+    ...(Array.isArray(aiExplanation.verification_checks) ? aiExplanation.verification_checks : []),
+  ]
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+
+  result.executive_summary = aiExplanation.explanation.trim() || result.executive_summary;
+  result.decision_explanation = aiExplanation.explanation.trim() || result.decision_explanation;
+  if (actions.length > 0) {
+    result.recommended_actions = Array.from(new Set(actions)).slice(0, 5);
+  }
+  result.explanation_model = aiExplanation.generated_by_model || config.geminiModel;
+  result.generated_at = aiExplanation.generated_at || isoNow();
+  result.token_usage = {
+    input:
+      typeof aiExplanation.input_tokens === 'number' && Number.isFinite(aiExplanation.input_tokens)
+        ? aiExplanation.input_tokens
+        : null,
+    output:
+      typeof aiExplanation.output_tokens === 'number' && Number.isFinite(aiExplanation.output_tokens)
+        ? aiExplanation.output_tokens
+        : null,
+  };
+  return result;
 }

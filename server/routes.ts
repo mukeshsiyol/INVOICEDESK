@@ -325,6 +325,7 @@ async function ingestBufferAndQueueRun(params: {
   processing_status: string;
   error_stage: number | null;
   error_message: string | null;
+  serverless_async: boolean;
 }> {
   const db = getDb();
   const invoiceId = crypto.randomUUID();
@@ -375,11 +376,8 @@ async function ingestBufferAndQueueRun(params: {
     metadata: { filename: safeDisplayFilename, file_size_bytes: params.buffer.length },
   });
 
-  if (params.autoStart) {
-    const p = startProcessingRun(runId);
-    if (config.isServerless) {
-      await p;
-    }
+  if (params.autoStart && !config.isServerless) {
+    void startProcessingRun(runId);
   }
 
   const persistedRun = db
@@ -394,6 +392,7 @@ async function ingestBufferAndQueueRun(params: {
     processing_status: persistedRun?.status || 'QUEUED',
     error_stage: persistedRun?.error_stage ?? null,
     error_message: persistedRun?.error_message ?? null,
+    serverless_async: config.isServerless && params.autoStart,
   };
 }
 
@@ -715,17 +714,41 @@ export function createApiRouter(): express.Router {
 
       const matches: Array<Record<string, unknown>> = [];
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const clientId = clientIds[i] || `file_${i}`;
-        const pdfCheck = validatePdfBuffer(file.buffer);
-        if (!pdfCheck.valid) {
-          matches.push({ client_id: clientId, is_duplicate: false, match_type: 'NONE', matched_fields: [] });
+      const inspectedFiles = await Promise.all(
+        files.map(async (file, i) => {
+          const clientId = clientIds[i] || `file_${i}`;
+          const pdfCheck = validatePdfBuffer(file.buffer);
+          if (!pdfCheck.valid) {
+            return { valid: false as const, file, clientId };
+          }
+          const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+          const fallbackSignals = {
+            vendorId: null,
+            vendorName: null,
+            invoiceNumber: null,
+            invoiceDate: null,
+            totalAmount: null,
+            hasNativeText: false,
+          };
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const signals = await Promise.race([
+            extractQuickInvoiceSignals(file.buffer, file.originalname, knownVendors).catch(() => fallbackSignals),
+            new Promise<typeof fallbackSignals>((resolve) => {
+              timer = setTimeout(() => resolve(fallbackSignals), 4000);
+            }),
+          ]).finally(() => {
+            if (timer) clearTimeout(timer);
+          });
+          return { valid: true as const, file, clientId, sha256, signals };
+        })
+      );
+
+      for (const item of inspectedFiles) {
+        if (!item.valid) {
+          matches.push({ client_id: item.clientId, is_duplicate: false, match_type: 'NONE', matched_fields: [] });
           continue;
         }
-
-        const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
-        const signals = await extractQuickInvoiceSignals(file.buffer, file.originalname, knownVendors);
+        const { file, clientId, sha256, signals } = item;
         const normInv = normalizeDocNumber(signals.invoiceNumber);
         const currDateMs = signals.invoiceDate ? Date.parse(signals.invoiceDate) : Number.NaN;
 
@@ -1020,53 +1043,19 @@ export function createApiRouter(): express.Router {
       const accepted: any[] = [];
       const rejected_files: Array<{ filename: string; reason: string }> = [];
 
-      if (config.isServerless && autoStart && files.length > 1) {
-        // Ingest all valid files first, then run Gemini extraction in bounded parallel chunks (4) to stay under Vercel's 60s timeout
-        for (const file of files) {
-          const check = validatePdfBuffer(file.buffer);
-          if (!check.valid) {
-            rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
-            continue;
-          }
-          const entry = await ingestBufferAndQueueRun({
-            buffer: file.buffer,
-            originalFilename: file.originalname,
-            userId: req.user!.id,
-            autoStart: false,
-          });
-          accepted.push(entry);
+      for (const file of files) {
+        const check = validatePdfBuffer(file.buffer);
+        if (!check.valid) {
+          rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
+          continue;
         }
-
-        const CONCURRENCY = 4;
-        for (let i = 0; i < accepted.length; i += CONCURRENCY) {
-          const chunk = accepted.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(chunk.map((item) => startProcessingRun(item.run_id)));
-        }
-
-        const db = getDb();
-        for (const item of accepted) {
-          const persistedRun = db
-            .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
-            .get(item.run_id) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
-          item.processing_status = persistedRun?.status || item.processing_status;
-          item.error_stage = persistedRun?.error_stage ?? null;
-          item.error_message = persistedRun?.error_message ?? null;
-        }
-      } else {
-        for (const file of files) {
-          const check = validatePdfBuffer(file.buffer);
-          if (!check.valid) {
-            rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
-            continue;
-          }
-          const entry = await ingestBufferAndQueueRun({
-            buffer: file.buffer,
-            originalFilename: file.originalname,
-            userId: req.user!.id,
-            autoStart,
-          });
-          accepted.push(entry);
-        }
+        const entry = await ingestBufferAndQueueRun({
+          buffer: file.buffer,
+          originalFilename: file.originalname,
+          userId: req.user!.id,
+          autoStart,
+        });
+        accepted.push(entry);
       }
 
       if (accepted.length === 0) {
@@ -1372,13 +1361,27 @@ export function createApiRouter(): express.Router {
       return;
     }
 
+    const ifQueued = req.body?.if_queued === true;
     const run = db
-      .prepare('SELECT id, run_number, status, started_at FROM processing_runs WHERE id = ?')
+      .prepare('SELECT id, run_number, status, started_at, error_stage, error_message FROM processing_runs WHERE id = ?')
       .get(inv.latest_run_id) as
-      | { id: string; run_number: number; status: string; started_at: string | null }
+      | { id: string; run_number: number; status: string; started_at: string | null; error_stage: number | null; error_message: string | null }
       | undefined;
 
     if (!run || run.status !== 'QUEUED' || run.started_at) {
+      if (run && ifQueued) {
+        res.status(202).json({
+          invoice_id: inv.id,
+          run_id: run.id,
+          run_number: run.run_number,
+          processing_status: run.status,
+          run_status: run.status,
+          error_stage: run.error_stage ?? null,
+          error_message: run.error_message ?? null,
+          already_started: true,
+        });
+        return;
+      }
       sendError(req, res, 409, 'INVALID_RUN_STATE', 'Only unstarted QUEUED runs can be started manually.');
       return;
     }
@@ -1502,21 +1505,21 @@ export function createApiRouter(): express.Router {
       return runNumber;
     });
 
-    const p = startProcessingRun(newRunId);
-    if (config.isServerless) {
-      await p;
+    if (!config.isServerless) {
+      void startProcessingRun(newRunId);
     }
-    const finishedRun = db
+    const persistedRun = db
       .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
       .get(newRunId) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
     res.status(202).json({
       invoice_id: inv.id,
       run_id: newRunId,
       run_number: nextRunNumber,
-      processing_status: finishedRun?.status || 'QUEUED',
-      run_status: finishedRun?.status || 'QUEUED',
-      error_stage: finishedRun?.error_stage ?? null,
-      error_message: finishedRun?.error_message ?? null,
+      processing_status: persistedRun?.status || 'QUEUED',
+      run_status: persistedRun?.status || 'QUEUED',
+      error_stage: persistedRun?.error_stage ?? null,
+      error_message: persistedRun?.error_message ?? null,
+      serverless_async: config.isServerless,
     });
   });
 

@@ -71,6 +71,14 @@ export interface NativePdfInspection {
   avgCharsPerPage: number;
 }
 
+export interface ExtractionProviderResult {
+  payload: ExtractedInvoicePayload;
+  latencyMs: number;
+  modelUsed: string;
+  fallbackUsed?: boolean;
+  fallbackReason?: string | null;
+}
+
 export interface ExtractionProvider {
   providerName: string;
   modelName: string;
@@ -78,7 +86,7 @@ export interface ExtractionProvider {
     pdfBuffer: Buffer;
     nativeInspection: NativePdfInspection;
     extractionMode: 'NATIVE_TEXT' | 'OCR';
-  }): Promise<{ payload: ExtractedInvoicePayload; latencyMs: number; modelUsed: string }>;
+  }): Promise<ExtractionProviderResult>;
 }
 
 export function validatePdfBuffer(buffer: Buffer): { valid: boolean; reason?: string } {
@@ -95,38 +103,80 @@ export function validatePdfBuffer(buffer: Buffer): { valid: boolean; reason?: st
   return { valid: true };
 }
 
-export async function inspectPdfNativeText(pdfBuffer: Buffer): Promise<NativePdfInspection> {
-  // Preload the worker module onto globalThis.pdfjsWorker so serverless bundlers
-  // (e.g. Vercel /var/task) trace pdf.worker.mjs statically and pdf.mjs skips dynamic import.
-  const pdfjsWorker = await import('pdfjs-dist/legacy/build/pdf.worker.mjs');
-  (globalThis as Record<string, unknown>).pdfjsWorker = pdfjsWorker;
-  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+let pdfjsLibPromise: Promise<typeof import('pdfjs-dist/legacy/build/pdf.mjs')> | null = null;
+
+async function getPdfJsLib() {
+  if (!pdfjsLibPromise) {
+    pdfjsLibPromise = (async () => {
+      // Preload worker module once onto globalThis.pdfjsWorker so serverless bundlers
+      // trace pdf.worker.mjs statically and pdf.mjs skips per-request dynamic import.
+      const pdfjsWorker = await import('pdfjs-dist/legacy/build/pdf.worker.mjs');
+      (globalThis as Record<string, unknown>).pdfjsWorker = pdfjsWorker;
+      return import('pdfjs-dist/legacy/build/pdf.mjs');
+    })().catch((err) => {
+      pdfjsLibPromise = null;
+      throw err;
+    });
+  }
+  return pdfjsLibPromise;
+}
+
+export async function inspectPdfNativeText(
+  pdfBuffer: Buffer,
+  options?: { maxPages?: number; timeoutMs?: number }
+): Promise<NativePdfInspection> {
+  const maxPages = Math.max(1, options?.maxPages ?? 25);
+  const timeoutMs = Math.max(500, options?.timeoutMs ?? 6000);
+  const pdfjsLib = await getPdfJsLib();
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
     verbosity: 0,
-    useSystemFonts: true,
+    useSystemFonts: false,
+    disableFontFace: true,
   });
 
-  const pdfDoc = await loadingTask.promise;
-  const pageCount = pdfDoc.numPages;
-  const pagesText: Array<{ page: number; text: string; charCount: number }> = [];
-  let totalNonWhitespace = 0;
+  const runInspection = async (): Promise<NativePdfInspection> => {
+    let pdfDoc: Awaited<typeof loadingTask.promise> | null = null;
+    try {
+      pdfDoc = await loadingTask.promise;
+      const pageCount = pdfDoc.numPages;
+      const pagesToRead = Math.min(pageCount, maxPages);
+      const pagesText: Array<{ page: number; text: string; charCount: number }> = [];
+      let totalNonWhitespace = 0;
 
-  for (let p = 1; p <= pageCount; p++) {
-    const page = await pdfDoc.getPage(p);
-    const textContent = await page.getTextContent();
-    const strings = textContent.items
-      .map((item) => ('str' in item ? item.str : ''))
-      .filter((s) => s.length > 0);
-    const joined = strings.join(' ').replace(/\s+/g, ' ').trim();
-    const nonWs = joined.replace(/\s+/g, '').length;
-    totalNonWhitespace += nonWs;
-    pagesText.push({ page: p, text: joined, charCount: nonWs });
+      for (let p = 1; p <= pagesToRead; p++) {
+        const page = await pdfDoc.getPage(p);
+        const textContent = await page.getTextContent();
+        const strings = textContent.items
+          .map((item) => ('str' in item ? item.str : ''))
+          .filter((s) => s.length > 0);
+        const joined = strings.join(' ').replace(/\s+/g, ' ').trim();
+        const nonWs = joined.replace(/\s+/g, '').length;
+        totalNonWhitespace += nonWs;
+        pagesText.push({ page: p, text: joined, charCount: nonWs });
+      }
+
+      const avgCharsPerPage = pagesToRead > 0 ? totalNonWhitespace / pagesToRead : 0;
+      return { pageCount, pagesText, avgCharsPerPage };
+    } finally {
+      await (pdfDoc as unknown as { destroy?: () => Promise<void> } | null)?.destroy?.().catch(() => {});
+    }
+  };
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      runInspection(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void loadingTask.destroy().catch(() => {});
+          reject(new Error(`PDF text inspection timed out after ${timeoutMs}ms.`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-
-  await (pdfDoc as unknown as { destroy?: () => Promise<void> }).destroy?.();
-  const avgCharsPerPage = pageCount > 0 ? totalNonWhitespace / pageCount : 0;
-  return { pageCount, pagesText, avgCharsPerPage };
 }
 
 export async function persistValidatedPdf(params: {
@@ -264,6 +314,89 @@ function isFallbackEligibleError(err: unknown): boolean {
   );
 }
 
+function buildDeterministicNativeExtraction(nativeInspection: NativePdfInspection): ExtractedInvoicePayload {
+  const fullText = nativeInspection.pagesText.map((p) => p.text).join(' ').replace(/\s+/g, ' ').trim();
+  const isCredit = /\bcredit\s*(?:memo|note)\b/i.test(fullText);
+
+  const vendorMatch =
+    fullText.match(/(?:Vendor|Supplier|From|Billed\s*By)\s*:\s*([A-Za-z0-9&.,'\-\s]{2,60}?)(?=\s+(?:INVOICE|Tax\s*ID|Address|Bill\s*To|Invoice\s*(?:No|Number|#)|Date)\b|$)/i) ||
+    fullText.match(/^([A-Za-z][A-Za-z0-9&.,'\-\s]{1,55}?)(?=\s+\d{1,5}\s+[A-Za-z]|\s+Tax\s*ID\b|\s+(?:TAX\s+)?INVOICE\b)/i);
+  const vendorName = vendorMatch?.[1]?.trim() || null;
+
+  const taxIdMatch = fullText.match(/Tax\s*ID\s*:\s*([A-Z0-9\-]{4,24})/i);
+  const invMatch = fullText.match(
+    /Invoice\s*(?:Number|No\.?|#)\s*:\s*([A-Z0-9][A-Z0-9\-\/ ]{1,24}?)(?=\s+(?:Invoice\s*Date|Due\s*Date|PO\s*Number|Purchase\s*Order|P\.O\.|Currency|Date|Bill\s*To|Description|Subtotal|Total)\b|$)/i
+  );
+  const invoiceNumber =
+    invMatch?.[1] && !/^(MISSING|N\/A|NONE|DRAFT|NULL|TBD)$/i.test(invMatch[1].trim())
+      ? invMatch[1].trim().replace(/\s+/g, ' ')
+      : null;
+
+  const invDateMatch = fullText.match(/(?:Invoice\s*Date|Issue\s*Date|Date\s*Issued)\s*:\s*(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/i);
+  const dueDateMatch = fullText.match(/Due\s*Date\s*:\s*(\d{4}-\d{2}-\d{2}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/i);
+  const poMatch = fullText.match(/(?:Purchase\s*Order|PO\s*Number|P\.O\.?\s*#?)\s*:\s*([A-Z0-9][A-Z0-9\-]{2,24})/i);
+  const currMatch = fullText.match(/\b(USD|EUR|GBP|CAD|AUD|JPY|INR)\b/);
+  const subMatch = fullText.match(/Subtotal\s*:\s*(?:USD|EUR|GBP|CAD|AUD|\$|€|£)?\s*(-?[\d,]+\.\d{2})/i);
+  const taxMatch = fullText.match(/\bTax(?:\s*\([^)]+\))?\s*:\s*(?:USD|EUR|GBP|CAD|AUD|\$|€|£)?\s*(-?[\d,]+\.\d{2})/i);
+  const totMatch = fullText.match(/(?:Grand\s+Total|Total\s+Amount\s+Due|Total\s+Due|Balance\s+Due|Total\s+Amount|\bTotal)\s*:\s*(?:USD|EUR|GBP|CAD|AUD|\$|€|£)?\s*(-?[\d,]+\.\d{2})/i);
+
+  const cleanNum = (raw?: string) => (raw ? raw.replace(/,/g, '') : null);
+  const subtotal = cleanNum(subMatch?.[1]);
+  const taxAmount = cleanNum(taxMatch?.[1]);
+  const totalAmount = cleanNum(totMatch?.[1]);
+  const currency = currMatch?.[1]?.toUpperCase() || (fullText.includes('$') ? 'USD' : null);
+
+  return {
+    document_type: isCredit ? 'CREDIT_NOTE' : 'INVOICE',
+    vendor: {
+      name: vendorName,
+      tax_id: taxIdMatch?.[1]?.trim() || null,
+      address: null,
+    },
+    invoice_number: invoiceNumber,
+    invoice_date: normalizeIsoDateString(invDateMatch?.[1]),
+    due_date: normalizeIsoDateString(dueDateMatch?.[1]),
+    po_number: poMatch?.[1] && !/^(MISSING|N\/A|NONE)$/i.test(poMatch[1]) ? poMatch[1].trim() : null,
+    currency,
+    subtotal,
+    tax_amount: taxAmount,
+    tax_mode: taxAmount ? 'SEPARATED' : 'UNKNOWN',
+    discount_amount: null,
+    total_amount: totalAmount,
+    line_items: totalAmount
+      ? [
+          {
+            line_number: 1,
+            description: 'Invoice document summary (deterministic native-text fallback)',
+            is_bundled: false,
+            quantity: '1',
+            unit_price: subtotal || totalAmount,
+            tax_amount: taxAmount,
+            line_total: subtotal || totalAmount,
+          },
+        ]
+      : [],
+    field_confidence: {
+      vendor_name: vendorName ? 0.72 : 0,
+      invoice_number: invoiceNumber ? 0.72 : 0,
+      invoice_date: invDateMatch?.[1] ? 0.72 : 0,
+      po_number: poMatch?.[1] ? 0.72 : 0,
+      currency: currency ? 0.72 : 0,
+      subtotal: subtotal ? 0.72 : 0,
+      tax_amount: taxAmount ? 0.72 : 0,
+      total_amount: totalAmount ? 0.72 : 0,
+    },
+    extraction_evidence: fullText
+      ? [{ field: 'native_text_fallback', page: 1, snippet: fullText.slice(0, 240) }]
+      : [],
+    raw_ocr_pages: nativeInspection.pagesText.map((p) => ({
+      page: p.page,
+      text: p.text,
+      ocr_confidence: 0.9,
+    })),
+  };
+}
+
 export class GeminiExtractionProvider implements ExtractionProvider {
   providerName = 'gemini';
   modelName = config.geminiModel;
@@ -277,7 +410,7 @@ export class GeminiExtractionProvider implements ExtractionProvider {
     return new GoogleGenAI({
       apiKey: config.geminiApiKey,
       httpOptions: {
-        timeout: 18_000,
+        timeout: 11_000,
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -289,9 +422,28 @@ export class GeminiExtractionProvider implements ExtractionProvider {
     pdfBuffer: Buffer;
     nativeInspection: NativePdfInspection;
     extractionMode: 'NATIVE_TEXT' | 'OCR';
-  }): Promise<{ payload: ExtractedInvoicePayload; latencyMs: number; modelUsed: string }> {
-    const ai = this.getClient();
+  }): Promise<ExtractionProviderResult> {
     const start = Date.now();
+    const hasNativeFallback =
+      params.extractionMode === 'NATIVE_TEXT' &&
+      params.nativeInspection.pagesText.some((p) => p.text.trim().length >= 20);
+
+    if (!config.geminiApiKey || config.geminiApiKey === 'MY_GEMINI_API_KEY') {
+      if (hasNativeFallback) {
+        return {
+          payload: buildDeterministicNativeExtraction(params.nativeInspection),
+          latencyMs: Date.now() - start,
+          modelUsed: 'deterministic-native-fallback',
+          fallbackUsed: true,
+          fallbackReason: 'GEMINI_API_KEY is not configured; used deterministic native text parser.',
+        };
+      }
+      throw new Error(
+        'GEMINI_API_KEY is not configured. Configure GEMINI_API_KEY in your environment or .env to run live AI invoice extraction.'
+      );
+    }
+
+    const ai = this.getClient();
     const nonce = crypto.randomBytes(8).toString('hex');
 
     const systemInstruction = [
@@ -335,55 +487,59 @@ export class GeminiExtractionProvider implements ExtractionProvider {
     let lastError: unknown;
     for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
       const activeModel = candidateModels[mIdx];
-      const maxAttempts = mIdx === 0 ? 1 : 2;
-      const attemptTimeoutMs = mIdx === 0 ? 12_000 : 18_000;
-      let hitCapacityLimit = false;
+      const attemptTimeoutMs = mIdx === 0 ? 10_000 : 8_000;
 
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        try {
-          const response = await ai.models.generateContent({
-            model: activeModel,
-            contents: contents as any,
-            config: {
-              systemInstruction,
-              responseMimeType: 'application/json',
-              responseSchema: extractionResponseSchema as any,
-              seed: 42,
-              abortSignal: AbortSignal.timeout(attemptTimeoutMs),
-            },
-          });
+      try {
+        const response = await ai.models.generateContent({
+          model: activeModel,
+          contents: contents as any,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: extractionResponseSchema as any,
+            ...(activeModel.startsWith('gemini-4-')
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            seed: 42,
+            abortSignal: AbortSignal.timeout(attemptTimeoutMs),
+          },
+        });
 
-          const rawJson = (response.text ?? '').trim();
-          if (!rawJson) {
-            throw new Error('Gemini returned an empty extraction response.');
-          }
+        const rawJson = (response.text ?? '').trim();
+        if (!rawJson) {
+          throw new Error('Gemini returned an empty extraction response.');
+        }
 
-          const parsed = JSON.parse(rawJson);
-          const validated = ExtractedInvoiceSchema.parse(parsed);
+        const parsed = JSON.parse(rawJson);
+        const validated = ExtractedInvoiceSchema.parse(parsed);
 
-          if (params.extractionMode === 'NATIVE_TEXT' && validated.raw_ocr_pages.length === 0) {
-            validated.raw_ocr_pages = params.nativeInspection.pagesText.map((p) => ({
-              page: p.page,
-              text: p.text,
-              ocr_confidence: 1.0,
-            }));
-          }
+        if (params.extractionMode === 'NATIVE_TEXT' && validated.raw_ocr_pages.length === 0) {
+          validated.raw_ocr_pages = params.nativeInspection.pagesText.map((p) => ({
+            page: p.page,
+            text: p.text,
+            ocr_confidence: 1.0,
+          }));
+        }
 
-          return { payload: validated, latencyMs: Date.now() - start, modelUsed: activeModel };
-        } catch (err) {
-          lastError = err;
-          const canFallback = isFallbackEligibleError(err);
-          if (!canFallback) {
-            throw err instanceof Error ? err : new Error(String(err));
-          }
-          hitCapacityLimit = true;
-          if (attempt < maxAttempts - 1) {
-            await new Promise((r) => setTimeout(r, 900));
-          }
+        return { payload: validated, latencyMs: Date.now() - start, modelUsed: activeModel };
+      } catch (err) {
+        lastError = err;
+        if (!isFallbackEligibleError(err)) {
+          throw err instanceof Error ? err : new Error(String(err));
         }
       }
+    }
 
-      if (!hitCapacityLimit) break;
+    if (hasNativeFallback && isFallbackEligibleError(lastError)) {
+      const reason = lastError instanceof Error ? lastError.message : String(lastError);
+      console.warn('[Extraction] Gemini timed out/unavailable; using deterministic native fallback:', reason);
+      return {
+        payload: buildDeterministicNativeExtraction(params.nativeInspection),
+        latencyMs: Date.now() - start,
+        modelUsed: 'deterministic-native-fallback',
+        fallbackUsed: true,
+        fallbackReason: reason,
+      };
     }
 
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
@@ -563,7 +719,7 @@ export async function generateDecisionExplanation(params: {
   const ai = new GoogleGenAI({
     apiKey: config.geminiApiKey,
     httpOptions: {
-      timeout: 15_000,
+      timeout: 10_000,
       headers: { 'User-Agent': 'aistudio-build' },
     },
   });
@@ -601,60 +757,53 @@ export async function generateDecisionExplanation(params: {
   let lastError: unknown;
   for (let mIdx = 0; mIdx < candidateModels.length; mIdx++) {
     const model = candidateModels[mIdx];
-    const maxAttempts = mIdx === 0 ? 1 : 2;
-    let hitCapacityLimit = false;
+    const attemptTimeoutMs = mIdx === 0 ? 9_500 : 7_500;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: `Explain this Accounts Payable pipeline decision clearly for compliance and AP reviewers.\n\n<verified_ap_decision nonce="${nonce}">\n${JSON.stringify(promptContext)}\n</verified_ap_decision>`,
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: decisionExplanationSchema as any,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            seed: 42,
-            abortSignal: AbortSignal.timeout(13_000),
-          },
-        });
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: `Explain this Accounts Payable pipeline decision clearly for compliance and AP reviewers.\n\n<verified_ap_decision nonce="${nonce}">\n${JSON.stringify(promptContext)}\n</verified_ap_decision>`,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: decisionExplanationSchema as any,
+          ...(model.startsWith('gemini-4-')
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
+          seed: 42,
+          abortSignal: AbortSignal.timeout(attemptTimeoutMs),
+        },
+      });
 
-        const raw = (response.text ?? '').trim();
-        if (!raw) {
-          throw new Error('Gemini Flash returned an empty explanation response.');
-        }
+      const raw = (response.text ?? '').trim();
+      if (!raw) {
+        throw new Error('Gemini Flash returned an empty explanation response.');
+      }
 
-        const parsed = z
-          .object({
-            explanation: z.string().min(1),
-            key_findings: z.array(z.string()).min(1).max(6),
-            recommended_action: z.string().min(1),
-            verification_checks: z.array(z.string()).max(4).default([]),
-            suggested_po_number: z.string().nullable().default(null),
-          })
-          .parse(JSON.parse(raw));
+      const parsed = z
+        .object({
+          explanation: z.string().min(1),
+          key_findings: z.array(z.string()).min(1).max(6),
+          recommended_action: z.string().min(1),
+          verification_checks: z.array(z.string()).max(4).default([]),
+          suggested_po_number: z.string().nullable().default(null),
+        })
+        .parse(JSON.parse(raw));
 
-        const usage = (response as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } }).usageMetadata;
-        return {
-          ...parsed,
-          generated_by_model: (response as { modelVersion?: string }).modelVersion || model,
-          generated_at: new Date().toISOString(),
-          input_tokens: Number.isFinite(usage?.promptTokenCount) ? Number(usage?.promptTokenCount) : null,
-          output_tokens: Number.isFinite(usage?.candidatesTokenCount) ? Number(usage?.candidatesTokenCount) : null,
-        };
-      } catch (err) {
-        lastError = err;
-        if (!isFallbackEligibleError(err)) {
-          throw err instanceof Error ? err : new Error(String(err));
-        }
-        hitCapacityLimit = true;
-        if (attempt < maxAttempts - 1) {
-          await new Promise((r) => setTimeout(r, 800));
-        }
+      const usage = (response as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } }).usageMetadata;
+      return {
+        ...parsed,
+        generated_by_model: (response as { modelVersion?: string }).modelVersion || model,
+        generated_at: new Date().toISOString(),
+        input_tokens: Number.isFinite(usage?.promptTokenCount) ? Number(usage?.promptTokenCount) : null,
+        output_tokens: Number.isFinite(usage?.candidatesTokenCount) ? Number(usage?.candidatesTokenCount) : null,
+      };
+    } catch (err) {
+      lastError = err;
+      if (!isFallbackEligibleError(err)) {
+        throw err instanceof Error ? err : new Error(String(err));
       }
     }
-
-    if (!hitCapacityLimit) break;
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gemini explanation failed.'));
@@ -924,7 +1073,7 @@ export async function extractQuickInvoiceSignals(
   let fullText = '';
   let hasNativeText = false;
   try {
-    const native = await inspectPdfNativeText(pdfBuffer);
+    const native = await inspectPdfNativeText(pdfBuffer, { maxPages: 3, timeoutMs: 3500 });
     fullText = native.pagesText.map((p) => p.text).join(' ').replace(/\s+/g, ' ').trim();
     hasNativeText = native.avgCharsPerPage >= 25 && fullText.length >= 25;
   } catch {
