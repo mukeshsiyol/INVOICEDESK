@@ -5,7 +5,8 @@ import zlib from 'node:zlib';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { hashPassword } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow } from './db.ts';
+import { getDb, isoNow, safeRollback } from './db.ts';
+import { buildExplanationRecord } from './explanation.ts';
 import {
   DEFAULT_REJECTION_BODY_TEMPLATE,
   DEFAULT_REJECTION_SUBJECT_TEMPLATE,
@@ -449,6 +450,7 @@ export async function ensureDemoFixturesGenerated(): Promise<void> {
       }),
   };
 
+  await fs.mkdir(config.fixturesDir, { recursive: true });
   for (const [filename, builder] of Object.entries(files)) {
     const dest = path.join(config.fixturesDir, filename);
     try {
@@ -458,6 +460,70 @@ export async function ensureDemoFixturesGenerated(): Promise<void> {
       await fs.writeFile(dest, buf);
     }
   }
+}
+
+const SEEDED_INVOICE_PDF_SPECS: Record<
+  string,
+  {
+    vendorName: string;
+    invNo: string;
+    date: string;
+    poNumber: string;
+    subtotal: string;
+    tax: string;
+    total: string;
+  }
+> = {
+  'inv-seed-001': {
+    vendorName: 'Summit Design Studio',
+    invNo: 'SDS-2026-088',
+    date: '2026-11-04',
+    poNumber: 'PO-2026-401',
+    subtotal: '1500.00',
+    tax: '0.00',
+    total: '1500.00',
+  },
+  'inv-seed-002': {
+    vendorName: 'Acme Cloud Services LLC',
+    invNo: 'INV-2026-0311',
+    date: '2026-11-09',
+    poNumber: 'PO-2026-900',
+    subtotal: '620.00',
+    tax: '0.00',
+    total: '620.00',
+  },
+  'inv-seed-003': {
+    vendorName: 'Summit Design Studio',
+    invNo: 'SDS-2026-099',
+    date: '2026-11-15',
+    poNumber: 'PO-2026-401',
+    subtotal: '3850.00',
+    tax: '0.00',
+    total: '3850.00',
+  },
+};
+
+export async function regenerateSeededInvoicePdfIfMissing(invoiceId: string): Promise<Buffer | null> {
+  const spec = SEEDED_INVOICE_PDF_SPECS[invoiceId];
+  if (!spec) return null;
+  const pdfBuf = await buildTextInvoicePdf({
+    vendorName: spec.vendorName,
+    vendorAddress: '210 NW 11th Ave, Portland, OR',
+    invoiceNumber: spec.invNo,
+    invoiceDate: spec.date,
+    dueDate: '2026-12-01',
+    poNumber: spec.poNumber,
+    currency: 'USD',
+    lines: [{ desc: 'Historical Baseline Service Period', qty: '1', unitPrice: spec.subtotal, total: spec.subtotal }],
+    subtotal: spec.subtotal,
+    tax: spec.tax,
+    total: spec.total,
+  });
+  const sha = crypto.createHash('sha256').update(pdfBuf).digest('hex');
+  const dir = path.join(config.storageDir, invoiceId);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, `${sha}.pdf`), pdfBuf);
+  return pdfBuf;
 }
 
 export async function seedInitialDatabase(): Promise<void> {
@@ -756,26 +822,71 @@ export async function seedInitialDatabase(): Promise<void> {
       ).run(opts.runId, s, `STAGE_${s}`, stages[s - 1], createdAt);
     }
 
+    const seededRules = [
+      {
+        rule_id: opts.outcome === 'APPROVE' ? 'R-00' : opts.outcome === 'REJECT' ? 'R-03' : 'R-11',
+        reason_code: opts.reasonCode,
+        decision: opts.outcome,
+        severity: (opts.outcome === 'APPROVE' ? 'INFO' : opts.outcome === 'REJECT' ? 'CRITICAL' : 'HIGH') as
+          | 'INFO'
+          | 'CRITICAL'
+          | 'HIGH',
+        message: opts.explanation,
+        evidence: {},
+      },
+    ];
+    const seededSnapshot: Record<string, unknown> = {
+      deterministic_rule_summary: opts.explanation,
+      validation: { passed: true },
+      vendor: { canonicalName: opts.vendorName, vendorStatus: 'APPROVED' },
+      duplicate: { isExactFileDuplicate: false, isBusinessDuplicate: false, isNearDuplicate: false, matchType: 'NONE' },
+      poMatch: { matchStatus: opts.poNumber ? 'EXACT' : 'MISSING_REF', matchedPoNumber: opts.poNumber },
+      tolerance: { evaluated: Boolean(opts.poNumber), withinTolerance: opts.outcome === 'APPROVE' },
+    };
+    const seededExplanationRecord = buildExplanationRecord({
+      input: {
+        outcome: opts.outcome,
+        primaryReasonCode: opts.reasonCode,
+        triggeredRules: seededRules,
+        evidenceSnapshot: seededSnapshot,
+        invoice: {
+          filename: opts.filename,
+          vendor: opts.vendorName,
+          invoiceNumber: opts.invNo,
+          currency: 'USD',
+          subtotal: opts.subtotal,
+          tax: opts.tax,
+          total: opts.total,
+          purchaseOrder: opts.poNumber,
+        },
+      },
+      fallbackReason: opts.explanation,
+    });
+
     db.prepare(
-      `INSERT INTO decisions (id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?)`
+      `INSERT INTO decisions (
+         id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
+         explanation_source, explanation_provider, explanation_model, explanation_prompt_version,
+         explanation_status, explanation_generated_at, explanation_fallback_reason, explanation_json, created_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       opts.decId,
       opts.runId,
       opts.invId,
       opts.outcome,
       opts.reasonCode,
-      JSON.stringify([
-        {
-          rule_id: opts.outcome === 'APPROVE' ? 'R-00' : opts.outcome === 'REJECT' ? 'R-03' : 'R-11',
-          reason_code: opts.reasonCode,
-          decision: opts.outcome,
-          severity: opts.outcome === 'APPROVE' ? 'INFO' : opts.outcome === 'REJECT' ? 'CRITICAL' : 'HIGH',
-          message: opts.explanation,
-          evidence: {},
-        },
-      ]),
+      JSON.stringify(seededRules),
       opts.explanation,
+      JSON.stringify(seededSnapshot),
+      seededExplanationRecord.explanation_source,
+      seededExplanationRecord.explanation_provider,
+      seededExplanationRecord.explanation_model,
+      seededExplanationRecord.prompt_version,
+      seededExplanationRecord.generation_status,
+      seededExplanationRecord.generated_at,
+      seededExplanationRecord.fallback_reason,
+      JSON.stringify(seededExplanationRecord),
       createdAt
     );
 
@@ -890,7 +1001,7 @@ export async function resetDemoDatabase(): Promise<void> {
     `);
     db.exec('COMMIT;');
   } catch (err) {
-    db.exec('ROLLBACK;');
+    safeRollback(db);
     throw err;
   }
 

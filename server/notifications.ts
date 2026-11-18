@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { getDb, isoNow } from './db.ts';
+import { getDb, isoNow, withTransaction } from './db.ts';
 
 export type NotificationEventType =
   | 'INVOICE_UPLOADED'
@@ -183,7 +183,8 @@ export function listNotificationsForUser(
   const db = getDb();
   const enabledTypes = getEnabledEventTypes();
   const placeholders = enabledTypes.map(() => '?').join(',');
-  const limit = Math.min(100, Math.max(1, Number(opts.limit || 30)));
+  const rawLimit = Number(opts.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, Math.trunc(rawLimit))) : 30;
 
   const whereClauses: string[] = [`n.event_type IN (${placeholders})`];
   const params: any[] = [userId, ...enabledTypes];
@@ -292,9 +293,11 @@ export function markAllNotificationsRead(userId: string): number {
   const stmt = db.prepare(
     `INSERT OR IGNORE INTO notification_reads (notification_id, user_id, read_at) VALUES (?, ?, ?)`
   );
-  for (const row of unread) {
-    stmt.run(row.id, userId, now);
-  }
+  withTransaction(db, () => {
+    for (const row of unread) {
+      stmt.run(row.id, userId, now);
+    }
+  });
 
   notificationBroker.publish({
     id: Date.now(),

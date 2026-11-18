@@ -7,6 +7,28 @@ import {
 
 let dbInstance: DatabaseSync | null = null;
 
+export function safeRollback(db: DatabaseSync): void {
+  try {
+    const inTx = (db as unknown as { isTransaction?: boolean }).isTransaction;
+    if (inTx === false) return;
+    db.exec('ROLLBACK;');
+  } catch {
+    // SQLite may have already rolled back automatically on constraint/busy errors
+  }
+}
+
+export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    const result = fn();
+    db.exec('COMMIT;');
+    return result;
+  } catch (err) {
+    safeRollback(db);
+    throw err;
+  }
+}
+
 export function getDb(): DatabaseSync {
   if (!dbInstance) {
     dbInstance = new DatabaseSync(config.dbPath);
@@ -263,29 +285,26 @@ function initSchema(db: DatabaseSync): void {
     .get() as { sql?: string } | undefined;
   if (usersTableMeta?.sql && !usersTableMeta.sql.includes("'AUDITOR'")) {
     db.exec('PRAGMA foreign_keys = OFF;');
-    db.exec('BEGIN IMMEDIATE;');
     try {
-      db.exec(`
-        CREATE TABLE users_new (
-          id TEXT PRIMARY KEY,
-          email TEXT NOT NULL UNIQUE,
-          full_name TEXT NOT NULL,
-          password_hash TEXT NOT NULL,
-          role TEXT NOT NULL CHECK (role IN ('OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN')),
-          theme_preference TEXT NOT NULL DEFAULT 'light' CHECK (theme_preference IN ('light', 'dark', 'system')),
-          is_active INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        INSERT INTO users_new (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
-        SELECT id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at FROM users;
-        DROP TABLE users;
-        ALTER TABLE users_new RENAME TO users;
-      `);
-      db.exec('COMMIT;');
-    } catch (err) {
-      db.exec('ROLLBACK;');
-      throw err;
+      withTransaction(db, () => {
+        db.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            full_name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN')),
+            theme_preference TEXT NOT NULL DEFAULT 'light' CHECK (theme_preference IN ('light', 'dark', 'system')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+          INSERT INTO users_new (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
+          SELECT id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at FROM users;
+          DROP TABLE users;
+          ALTER TABLE users_new RENAME TO users;
+        `);
+      });
     } finally {
       db.exec('PRAGMA foreign_keys = ON;');
     }

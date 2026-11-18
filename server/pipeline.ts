@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import Decimal from 'decimal.js';
 import { writeAuditLog } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow } from './db.ts';
+import { getDb, isoNow, safeRollback } from './db.ts';
 import {
   normalizeDocNumber,
   parseDecimalSafe,
@@ -15,6 +15,7 @@ import {
   runStage8DecisionGeneration,
   type ApplicationSettingsRow,
 } from './engine.ts';
+import { buildExplanationRecord } from './explanation.ts';
 import {
   defaultExtractionProvider,
   generateDecisionExplanation,
@@ -42,9 +43,18 @@ sseBroker.setMaxListeners(100);
 const MAX_CONCURRENT_RUNS = 4;
 let activeWorkers = 0;
 const pendingQueue: Array<() => Promise<void>> = [];
+const queuedOrRunningIds = new Set<string>();
 
-function enqueueWork(fn: () => Promise<void>): void {
-  pendingQueue.push(fn);
+function enqueueWork(runId: string, fn: () => Promise<void>): void {
+  if (queuedOrRunningIds.has(runId)) return;
+  queuedOrRunningIds.add(runId);
+  pendingQueue.push(async () => {
+    try {
+      await fn();
+    } finally {
+      queuedOrRunningIds.delete(runId);
+    }
+  });
   void drainQueue();
 }
 
@@ -129,10 +139,16 @@ function persistAndEmitStageEvent(params: {
 
 export async function startProcessingRun(runId: string): Promise<void> {
   if (config.isServerless) {
-    await executeProcessingRun(runId);
+    if (queuedOrRunningIds.has(runId)) return;
+    queuedOrRunningIds.add(runId);
+    try {
+      await executeProcessingRun(runId);
+    } finally {
+      queuedOrRunningIds.delete(runId);
+    }
     return;
   }
-  enqueueWork(async () => {
+  enqueueWork(runId, async () => {
     await executeProcessingRun(runId);
   });
 }
@@ -140,10 +156,12 @@ export async function startProcessingRun(runId: string): Promise<void> {
 export async function executeProcessingRun(runId: string): Promise<void> {
   const db = getDb();
   const runRow = db
-    .prepare('SELECT id, invoice_id, run_number, trigger_type FROM processing_runs WHERE id = ?')
-    .get(runId) as { id: string; invoice_id: string; run_number: number; trigger_type: string } | undefined;
+    .prepare('SELECT id, invoice_id, run_number, trigger_type, status FROM processing_runs WHERE id = ?')
+    .get(runId) as
+    | { id: string; invoice_id: string; run_number: number; trigger_type: string; status: string }
+    | undefined;
 
-  if (!runRow) return;
+  if (!runRow || runRow.status !== 'QUEUED') return;
 
   const invoiceRow = db
     .prepare('SELECT id, original_filename, storage_key, file_sha256, file_size_bytes, po_consumed_applied FROM invoices WHERE id = ?')
@@ -168,10 +186,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
   const startedAt = isoNow();
   let currentStage = 1;
 
+  // Atomically claim the QUEUED run so concurrent callers cannot double-execute it
+  const claimed = db
+    .prepare(`UPDATE processing_runs SET status = 'RUNNING', current_stage = 1, started_at = ? WHERE id = ? AND status = 'QUEUED'`)
+    .run(startedAt, runId);
+  if (claimed.changes === 0) return;
+
   try {
-    db.prepare(
-      `UPDATE processing_runs SET status = 'RUNNING', current_stage = 1, started_at = ? WHERE id = ?`
-    ).run(startedAt, runId);
     db.prepare(`UPDATE invoices SET processing_status = 'RUNNING', updated_at = ? WHERE id = ?`).run(
       startedAt,
       invoiceRow.id
@@ -569,7 +590,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
       const latestInv = db
         .prepare('SELECT po_consumed_applied FROM invoices WHERE id = ?')
-        .get(invoiceRow.id) as { po_consumed_applied: number };
+        .get(invoiceRow.id) as { po_consumed_applied: number } | undefined;
 
       const totalDec = parseDecimalSafe(extracted.total_amount);
 
@@ -577,64 +598,114 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         finalOutcome === 'APPROVE' &&
         poMatch.matchedPoId &&
         totalDec &&
+        latestInv &&
         latestInv.po_consumed_applied === 0
       ) {
         const lockedPo = db
           .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
-          .get(poMatch.matchedPoId) as {
-          id: string;
-          original_amount: string;
-          consumed_amount: string;
-          status: string;
-        };
+          .get(poMatch.matchedPoId) as
+          | {
+              id: string;
+              original_amount: string;
+              consumed_amount: string;
+              status: string;
+            }
+          | undefined;
 
-        const orig = new Decimal(lockedPo.original_amount);
-        const consumed = new Decimal(lockedPo.consumed_amount);
-        const remBefore = Decimal.max(new Decimal(0), orig.minus(consumed));
-        const allowedCap = new Decimal(tolerance.allowedCap || '0');
-        const overrun = totalDec.minus(remBefore);
-
-        if (overrun.gt(allowedCap)) {
-          // Concurrent run exhausted PO while we were extracting!
-          finalOutcome = 'REVIEW';
-          finalReasonCode = 'TOLERANCE_EXCEEDED';
-          finalReviewStatus = 'PENDING_REVIEW';
-          finalExplanation = `Concurrent approval updated PO ${poMatch.matchedPoNumber} remaining balance to $${remBefore.toFixed(2)}. Invoice overrun ($${overrun.toFixed(2)}) exceeds cap ($${allowedCap.toFixed(2)}).`;
+        if (!lockedPo || lockedPo.status === 'CLOSED' || lockedPo.status === 'CANCELLED') {
+          finalOutcome = 'REJECT';
+          finalReasonCode = 'PO_CLOSED';
+          finalReviewStatus = 'NOT_REQUIRED';
+          finalExplanation = `Referenced purchase order ${poMatch.matchedPoNumber} is ${lockedPo?.status ?? 'unavailable'} and cannot accept new charges.`;
           finalTriggered = [
             ...finalTriggered,
             {
-              rule_id: 'R-11',
-              reason_code: 'TOLERANCE_EXCEEDED',
-              decision: 'REVIEW',
-              severity: 'HIGH',
+              rule_id: 'R-03',
+              reason_code: 'PO_CLOSED',
+              decision: 'REJECT',
+              severity: 'CRITICAL',
               message: finalExplanation,
-              evidence: { rem_before: remBefore.toFixed(2), overrun: overrun.toFixed(2) },
+              evidence: { po_id: poMatch.matchedPoId, po_status: lockedPo?.status ?? 'MISSING' },
             },
           ];
         } else {
-          const newConsumed = consumed.plus(totalDec);
-          const newStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
-          db.prepare(
-            `UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?`
-          ).run(newConsumed.toFixed(4), newStatus, completedAt, lockedPo.id);
-          db.prepare(`UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?`).run(invoiceRow.id);
+          const orig = new Decimal(lockedPo.original_amount);
+          const consumed = new Decimal(lockedPo.consumed_amount);
+          const remBefore = Decimal.max(new Decimal(0), orig.minus(consumed));
+          const allowedCap = new Decimal(tolerance.allowedCap || '0');
+          const overrun = totalDec.minus(remBefore);
+
+          if (overrun.gt(allowedCap)) {
+            // Concurrent run exhausted PO while we were extracting!
+            finalOutcome = 'REVIEW';
+            finalReasonCode = 'TOLERANCE_EXCEEDED';
+            finalReviewStatus = 'PENDING_REVIEW';
+            finalExplanation = `Concurrent approval updated PO ${poMatch.matchedPoNumber} remaining balance to $${remBefore.toFixed(2)}. Invoice overrun ($${overrun.toFixed(2)}) exceeds cap ($${allowedCap.toFixed(2)}).`;
+            finalTriggered = [
+              ...finalTriggered,
+              {
+                rule_id: 'R-11',
+                reason_code: 'TOLERANCE_EXCEEDED',
+                decision: 'REVIEW',
+                severity: 'HIGH',
+                message: finalExplanation,
+                evidence: { rem_before: remBefore.toFixed(2), overrun: overrun.toFixed(2) },
+              },
+            ];
+          } else {
+            const newConsumed = consumed.plus(totalDec);
+            const newStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
+            db.prepare(
+              `UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?`
+            ).run(newConsumed.toFixed(4), newStatus, completedAt, lockedPo.id);
+            db.prepare(`UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?`).run(invoiceRow.id);
+          }
         }
       }
+
+      const explanationChangedUnderLock = finalOutcome !== decisionResult.outcome;
+      const explanationRecord = buildExplanationRecord({
+        input: {
+          outcome: finalOutcome,
+          primaryReasonCode: finalReasonCode,
+          triggeredRules: finalTriggered,
+          evidenceSnapshot: decisionResult.evidenceSnapshot,
+          invoice: {
+            filename: invoiceRow.original_filename,
+            vendor: vendorResult.canonicalName || extracted.vendor.name,
+            invoiceNumber: extracted.invoice_number,
+            currency: extracted.currency,
+            subtotal: extracted.subtotal,
+            tax: extracted.tax_amount,
+            total: extracted.total_amount,
+            purchaseOrder: poMatch.matchedPoNumber || extracted.po_number,
+          },
+        },
+        aiExplanation: explanationChangedUnderLock ? null : aiDecisionExplanation,
+        fallbackReason: explanationChangedUnderLock
+          ? finalExplanation
+          : aiExplanationError || undefined,
+      });
 
       const fullEvidenceSnapshot = {
         ...decisionResult.evidenceSnapshot,
         deterministic_rule_summary: decisionResult.explanation,
-        ...(aiDecisionExplanation
+        ...(aiDecisionExplanation && !explanationChangedUnderLock
           ? { ai_decision_explanation: aiDecisionExplanation }
           : aiExplanationError
             ? { ai_explanation_error: aiExplanationError }
             : {}),
-        ...(aiReviewerBrief ? { ai_reviewer_brief: aiReviewerBrief } : {}),
+        ...(aiReviewerBrief && !explanationChangedUnderLock ? { ai_reviewer_brief: aiReviewerBrief } : {}),
       };
 
       db.prepare(
-        `INSERT INTO decisions (id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO decisions (
+           id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
+           explanation_source, explanation_provider, explanation_model, explanation_prompt_version,
+           explanation_status, explanation_generated_at, explanation_input_tokens, explanation_output_tokens,
+           explanation_fallback_reason, explanation_json, created_at
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         decisionId,
         runId,
@@ -644,6 +715,16 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         JSON.stringify(finalTriggered),
         finalExplanation,
         JSON.stringify(fullEvidenceSnapshot),
+        explanationRecord.explanation_source,
+        explanationRecord.explanation_provider,
+        explanationRecord.explanation_model,
+        explanationRecord.prompt_version,
+        explanationRecord.generation_status,
+        explanationRecord.generated_at,
+        explanationRecord.token_usage.input,
+        explanationRecord.token_usage.output,
+        explanationRecord.fallback_reason,
+        JSON.stringify(explanationRecord),
         completedAt
       );
 
@@ -681,7 +762,8 @@ export async function executeProcessingRun(runId: string): Promise<void> {
           run_number: runRow.run_number,
           primary_reason_code: finalReasonCode,
           explanation: finalExplanation,
-          explanation_model: aiDecisionExplanation?.generated_by_model ?? null,
+          explanation_model: explanationRecord.explanation_model,
+          explanation_source: explanationRecord.explanation_source,
         },
       });
 
@@ -738,7 +820,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         },
       });
     } catch (txErr) {
-      db.exec('ROLLBACK;');
+      safeRollback(db);
       throw txErr;
     }
   } catch (err) {
@@ -746,44 +828,48 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     const failedAt = isoNow();
     const durationMs = Date.now() - runStartMs;
 
-    db.prepare(
-      `UPDATE processing_runs SET status = 'FAILED', error_stage = ?, error_message = ?, completed_at = ?, duration_ms = ? WHERE id = ?`
-    ).run(currentStage, errMsg, failedAt, durationMs, runId);
+    try {
+      db.prepare(
+        `UPDATE processing_runs SET status = 'FAILED', error_stage = ?, error_message = ?, completed_at = ?, duration_ms = ? WHERE id = ?`
+      ).run(currentStage, errMsg, failedAt, durationMs, runId);
 
-    db.prepare(
-      `UPDATE invoices SET processing_status = 'FAILED', latest_run_id = ?, updated_at = ? WHERE id = ?`
-    ).run(runId, failedAt, invoiceRow.id);
+      db.prepare(
+        `UPDATE invoices SET processing_status = 'FAILED', latest_run_id = ?, updated_at = ? WHERE id = ?`
+      ).run(runId, failedAt, invoiceRow.id);
 
-    const failEventId = persistAndEmitStageEvent({
-      runId,
-      stageNumber: currentStage,
-      status: 'FAILED',
-      durationMs,
-      summary: `Stage ${currentStage} failed: ${errMsg}`,
-      evidence: { error_stage: currentStage, error_message: errMsg },
-    });
+      const failEventId = persistAndEmitStageEvent({
+        runId,
+        stageNumber: currentStage,
+        status: 'FAILED',
+        durationMs,
+        summary: `Stage ${currentStage} failed: ${errMsg}`,
+        evidence: { error_stage: currentStage, error_message: errMsg },
+      });
 
-    createWorkspaceNotification({
-      eventType: 'PIPELINE_FAILED',
-      severity: 'CRITICAL',
-      title: `Pipeline Failed (Stage ${currentStage})`,
-      message: `${invoiceRow.original_filename}: ${errMsg}`,
-      invoiceId: invoiceRow.id,
-      runId,
-      metadata: { error_stage: currentStage, error_message: errMsg },
-    });
+      createWorkspaceNotification({
+        eventType: 'PIPELINE_FAILED',
+        severity: 'CRITICAL',
+        title: `Pipeline Failed (Stage ${currentStage})`,
+        message: `${invoiceRow.original_filename}: ${errMsg}`,
+        invoiceId: invoiceRow.id,
+        runId,
+        metadata: { error_stage: currentStage, error_message: errMsg },
+      });
 
-    sseBroker.publish(runId, {
-      id: failEventId,
-      event: 'run_failed',
-      data: {
-        run_id: runId,
-        invoice_id: invoiceRow.id,
-        processing_status: 'FAILED',
-        error_stage: currentStage,
-        error_message: errMsg,
-      },
-    });
+      sseBroker.publish(runId, {
+        id: failEventId,
+        event: 'run_failed',
+        data: {
+          run_id: runId,
+          invoice_id: invoiceRow.id,
+          processing_status: 'FAILED',
+          error_stage: currentStage,
+          error_message: errMsg,
+        },
+      });
+    } catch (secondaryErr) {
+      console.error(`[Pipeline] Failed while recording failure for run ${runId}:`, secondaryErr);
+    }
   }
 }
 

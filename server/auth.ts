@@ -51,26 +51,32 @@ export function signSessionToken(user: AuthUser): string {
   );
 }
 
-export function setSessionCookie(res: Response, token: string, req?: Request): void {
+function getCookieBaseOptions(req?: Request) {
   const isHttps =
     Boolean(req?.secure) || req?.headers['x-forwarded-proto'] === 'https';
-  res.cookie(config.sessionCookieName, token, {
+  return {
     httpOnly: true,
-    sameSite: isHttps ? 'none' : 'lax',
+    sameSite: (isHttps ? 'none' : 'lax') as 'none' | 'lax',
     secure: isHttps,
     path: '/',
-    maxAge: 12 * 60 * 60 * 1000,
-  });
-  res.clearCookie(config.signedOutCookieName, { path: '/' });
+  };
 }
 
-export function clearSessionCookie(res: Response, markSignedOut = false): void {
-  res.clearCookie(config.sessionCookieName, { path: '/' });
+export function setSessionCookie(res: Response, token: string, req?: Request): void {
+  const base = getCookieBaseOptions(req);
+  res.cookie(config.sessionCookieName, token, {
+    ...base,
+    maxAge: 12 * 60 * 60 * 1000,
+  });
+  res.clearCookie(config.signedOutCookieName, base);
+}
+
+export function clearSessionCookie(res: Response, markSignedOut = false, req?: Request): void {
+  const base = getCookieBaseOptions(req);
+  res.clearCookie(config.sessionCookieName, base);
   if (markSignedOut) {
     res.cookie(config.signedOutCookieName, '1', {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
+      ...base,
       maxAge: 24 * 60 * 60 * 1000,
     });
   }
@@ -93,7 +99,10 @@ function getDemoUserByRole(role: UserRole = 'ADMIN'): AuthUser | null {
 }
 
 export function getUserFromRequest(req: Request): AuthUser | null {
-  if (config.pauseAuthForDemo || config.enableDemoRoleSwitcher) {
+  const isExplicitlySignedOut =
+    !config.pauseAuthForDemo && req.cookies?.[config.signedOutCookieName] === '1';
+
+  if (!isExplicitlySignedOut && (config.pauseAuthForDemo || config.enableDemoRoleSwitcher)) {
     const headerUserId = String(
       req.header('X-Demo-User-Id') ?? req.query?.demo_user_id ?? ''
     ).trim();

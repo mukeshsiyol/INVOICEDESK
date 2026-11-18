@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import Decimal from 'decimal.js';
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
 import {
   clearSessionCookie,
@@ -18,8 +18,9 @@ import {
   type UserRole,
 } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow } from './db.ts';
-import { normalizeDocNumber, normalizeVendorName } from './engine.ts';
+import { getDb, isoNow, safeRollback, withTransaction } from './db.ts';
+import { normalizeDocNumber, normalizeVendorName, parseDecimalSafe } from './engine.ts';
+import { buildExplanationRecord } from './explanation.ts';
 import {
   GeminiConfigurationError,
   extractQuickInvoiceSignals,
@@ -30,7 +31,12 @@ import {
   validatePdfBuffer,
   type RejectionNoticeTone,
 } from './extraction.ts';
-import { DEMO_FIXTURES, resetDemoDatabase } from './fixtures.ts';
+import {
+  DEMO_FIXTURES,
+  ensureDemoFixturesGenerated,
+  regenerateSeededInvoicePdfIfMissing,
+  resetDemoDatabase,
+} from './fixtures.ts';
 import { buildOpenApiSpec } from './openapi.ts';
 import {
   createWorkspaceNotification,
@@ -50,6 +56,47 @@ const upload = multer({
     files: config.maxBatchFiles,
   },
 });
+
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => unknown
+) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+function parsePositiveInt(val: unknown, fallback: number, max = 1000): number {
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.min(max, Math.max(1, Math.trunc(num)));
+}
+
+function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function sanitizeHeaderFilename(name: string, fallback = 'document.pdf'): string {
+  const cleaned = path
+    .basename(name || fallback)
+    .replace(/[\r\n"\\]/g, '_')
+    .trim();
+  return cleaned || fallback;
+}
+
+function safeSseWrite(res: Response, chunk: string): boolean {
+  if (res.writableEnded || res.destroyed) return false;
+  try {
+    res.write(chunk);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function sendError(
   req: Request,
@@ -162,7 +209,7 @@ function buildVendorReportRows(
   const vendors = (db.prepare('SELECT * FROM vendors ORDER BY vendor_code ASC').all() as any[])
     .map((v) => ({
       ...v,
-      aliases: JSON.parse(v.aliases || '[]') as string[],
+      aliases: safeJsonParse<string[]>(v.aliases, []),
     }))
     .filter((v) => {
       if (vendorId && vendorId !== 'ALL' && v.id !== vendorId) return false;
@@ -193,8 +240,8 @@ function buildVendorReportRows(
     let poCommitted = new Decimal(0);
     let poConsumed = new Decimal(0);
     for (const po of activePos) {
-      poCommitted = poCommitted.plus(po.original_amount || '0');
-      poConsumed = poConsumed.plus(po.consumed_amount || '0');
+      poCommitted = poCommitted.plus(parseDecimalSafe(po.original_amount) ?? 0);
+      poConsumed = poConsumed.plus(parseDecimalSafe(po.consumed_amount) ?? 0);
     }
     const poRemaining = Decimal.max(new Decimal(0), poCommitted.minus(poConsumed));
     const poUtilPct = poCommitted.gt(0) ? poConsumed.div(poCommitted).mul(100).toFixed(1) : '0.0';
@@ -215,14 +262,12 @@ function buildVendorReportRows(
 
     for (const inv of vendorInvoices) {
       if (inv.total_amount && inv.processing_status === 'COMPLETED') {
-        try {
-          const amt = new Decimal(inv.total_amount);
+        const amt = parseDecimalSafe(inv.total_amount);
+        if (amt) {
           totalInvoiced = totalInvoiced.plus(amt);
           if (inv.business_decision === 'APPROVE' || inv.review_status === 'APPROVED_BY_HUMAN') {
             approvedSpend = approvedSpend.plus(amt);
           }
-        } catch {
-          // ignore malformed decimal
         }
       }
       if (typeof inv.overall_confidence === 'number') {
@@ -293,8 +338,7 @@ async function ingestBufferAndQueueRun(params: {
   const now = isoNow();
   const safeDisplayFilename = path.basename(params.originalFilename).slice(0, 200) || 'invoice.pdf';
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
+  withTransaction(db, () => {
     db.prepare(
       `INSERT INTO invoices (id, uploaded_by, original_filename, storage_key, file_sha256, file_size_bytes, processing_status, business_decision, review_status, latest_run_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', 'NOT_REQUIRED', ?, ?, ?)`
@@ -314,12 +358,7 @@ async function ingestBufferAndQueueRun(params: {
       resourceId: invoiceId,
       details: { filename: safeDisplayFilename, sha256, size_bytes: params.buffer.length, run_id: runId },
     });
-
-    db.exec('COMMIT;');
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    throw err;
-  }
+  });
 
   const uploaderRow = db
     .prepare('SELECT full_name FROM users WHERE id = ?')
@@ -359,7 +398,20 @@ async function ingestBufferAndQueueRun(params: {
 }
 
 export function createApiRouter(): express.Router {
-  const router = express.Router();
+  const rawRouter = express.Router();
+  const router = new Proxy(rawRouter, {
+    get(target, prop, receiver) {
+      if (prop === 'get' || prop === 'post' || prop === 'patch' || prop === 'put' || prop === 'delete') {
+        const orig = Reflect.get(target, prop, target).bind(target);
+        return (pathPattern: any, ...handlers: any[]) =>
+          orig(
+            pathPattern,
+            ...handlers.map((h) => (typeof h === 'function' && h.length < 4 ? asyncHandler(h) : h))
+          );
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
 
   router.use((req, _res, next) => {
     req.requestId = `req_${crypto.randomBytes(6).toString('hex')}`;
@@ -413,7 +465,7 @@ export function createApiRouter(): express.Router {
   });
 
   router.post('/auth/logout', (req, res) => {
-    clearSessionCookie(res, !config.pauseAuthForDemo);
+    clearSessionCookie(res, !config.pauseAuthForDemo, req);
     res.json({ ok: true, auth_paused: config.pauseAuthForDemo });
   });
 
@@ -529,16 +581,22 @@ export function createApiRouter(): express.Router {
       return;
     }
     const filePath = path.join(config.fixturesDir, `${meta.key}.pdf`);
-    const buf = await fs.readFile(filePath);
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(filePath);
+    } catch {
+      await ensureDemoFixturesGenerated();
+      buf = await fs.readFile(filePath);
+    }
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${meta.filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeHeaderFilename(meta.filename)}"`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.send(buf);
   });
 
   // ==================== UPLOAD & PRECHECK ====================
   router.post('/invoices/precheck-hash', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), (req, res) => {
-    const hashes = Array.isArray(req.body?.hashes) ? req.body.hashes : [];
+    const hashes = Array.isArray(req.body?.hashes) ? req.body.hashes.slice(0, 50) : [];
     const db = getDb();
     const matches = hashes.map((h: { client_id?: string; sha256?: string }) => {
       if (!h?.sha256) return { client_id: h?.client_id, is_duplicate: false };
@@ -941,6 +999,10 @@ export function createApiRouter(): express.Router {
             sendError(req, res, 413, 'PAYLOAD_TOO_LARGE', 'File exceeds 25 MB maximum upload size.');
             return;
           }
+          if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+            sendError(req, res, 400, 'UPLOAD_LIMIT_EXCEEDED', `Maximum ${config.maxBatchFiles} files allowed per batch under field "files".`);
+            return;
+          }
           sendError(req, res, 400, 'UPLOAD_ERROR', err.message || 'Upload failed.');
           return;
         }
@@ -958,19 +1020,53 @@ export function createApiRouter(): express.Router {
       const accepted: any[] = [];
       const rejected_files: Array<{ filename: string; reason: string }> = [];
 
-      for (const file of files) {
-        const check = validatePdfBuffer(file.buffer);
-        if (!check.valid) {
-          rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
-          continue;
+      if (config.isServerless && autoStart && files.length > 1) {
+        // Ingest all valid files first, then run Gemini extraction in bounded parallel chunks (4) to stay under Vercel's 60s timeout
+        for (const file of files) {
+          const check = validatePdfBuffer(file.buffer);
+          if (!check.valid) {
+            rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
+            continue;
+          }
+          const entry = await ingestBufferAndQueueRun({
+            buffer: file.buffer,
+            originalFilename: file.originalname,
+            userId: req.user!.id,
+            autoStart: false,
+          });
+          accepted.push(entry);
         }
-        const entry = await ingestBufferAndQueueRun({
-          buffer: file.buffer,
-          originalFilename: file.originalname,
-          userId: req.user!.id,
-          autoStart,
-        });
-        accepted.push(entry);
+
+        const CONCURRENCY = 4;
+        for (let i = 0; i < accepted.length; i += CONCURRENCY) {
+          const chunk = accepted.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(chunk.map((item) => startProcessingRun(item.run_id)));
+        }
+
+        const db = getDb();
+        for (const item of accepted) {
+          const persistedRun = db
+            .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
+            .get(item.run_id) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
+          item.processing_status = persistedRun?.status || item.processing_status;
+          item.error_stage = persistedRun?.error_stage ?? null;
+          item.error_message = persistedRun?.error_message ?? null;
+        }
+      } else {
+        for (const file of files) {
+          const check = validatePdfBuffer(file.buffer);
+          if (!check.valid) {
+            rejected_files.push({ filename: file.originalname, reason: check.reason || 'Invalid PDF' });
+            continue;
+          }
+          const entry = await ingestBufferAndQueueRun({
+            buffer: file.buffer,
+            originalFilename: file.originalname,
+            userId: req.user!.id,
+            autoStart,
+          });
+          accepted.push(entry);
+        }
       }
 
       if (accepted.length === 0) {
@@ -996,7 +1092,14 @@ export function createApiRouter(): express.Router {
       sendError(req, res, 404, 'NOT_FOUND', 'Demo fixture key not found.');
       return;
     }
-    const buf = await fs.readFile(path.join(config.fixturesDir, `${meta.key}.pdf`));
+    const fixturePath = path.join(config.fixturesDir, `${meta.key}.pdf`);
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(fixturePath);
+    } catch {
+      await ensureDemoFixturesGenerated();
+      buf = await fs.readFile(fixturePath);
+    }
     const entry = await ingestBufferAndQueueRun({
       buffer: buf,
       originalFilename: meta.filename,
@@ -1009,8 +1112,8 @@ export function createApiRouter(): express.Router {
   // ==================== INVOICES LIST, EXPORT, DETAIL, DOCUMENT ====================
   router.get('/invoices', requireAuth, (req, res) => {
     const db = getDb();
-    const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 20)));
+    const page = parsePositiveInt(req.query.page, 1, 10_000);
+    const pageSize = parsePositiveInt(req.query.page_size, 20, 100);
     const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query);
 
     const total = (
@@ -1046,7 +1149,13 @@ export function createApiRouter(): express.Router {
 
   router.get('/invoices/export', requireAuth, (req, res) => {
     const db = getDb();
-    const idsParam = req.query.ids ? String(req.query.ids).split(',').filter(Boolean) : [];
+    const idsParam = req.query.ids
+      ? String(req.query.ids)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 500)
+      : [];
     const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query, idsParam);
 
     const rows = db
@@ -1139,7 +1248,7 @@ export function createApiRouter(): express.Router {
           .prepare('SELECT * FROM stage_events WHERE run_id = ? ORDER BY id ASC')
           .all(activeRun.id) as any[]).map((ev) => ({
           ...ev,
-          evidence: JSON.parse(ev.evidence_json || '{}'),
+          evidence: safeJsonParse<Record<string, unknown>>(ev.evidence_json, {}),
         }))
       : [];
 
@@ -1153,15 +1262,9 @@ export function createApiRouter(): express.Router {
     const decision = decisionRow
       ? {
           ...decisionRow,
-          triggered_rules: JSON.parse(decisionRow.triggered_rules || '[]'),
-          evidence_snapshot: JSON.parse(decisionRow.evidence_snapshot || '{}'),
-          explanation_details: (() => {
-            try {
-              return JSON.parse(decisionRow.explanation_json || '{}');
-            } catch {
-              return {};
-            }
-          })(),
+          triggered_rules: safeJsonParse<any[]>(decisionRow.triggered_rules, []),
+          evidence_snapshot: safeJsonParse<Record<string, unknown>>(decisionRow.evidence_snapshot, {}),
+          explanation_details: safeJsonParse<Record<string, unknown>>(decisionRow.explanation_json, {}),
         }
       : null;
 
@@ -1184,14 +1287,7 @@ export function createApiRouter(): express.Router {
           .all(invoice.purchase_order_id, invoice.id)
       : [];
 
-    let rawExtracted: any = null;
-    if (activeRun?.raw_extracted_json) {
-      try {
-        rawExtracted = JSON.parse(activeRun.raw_extracted_json);
-      } catch {
-        rawExtracted = null;
-      }
-    }
+    const rawExtracted = safeJsonParse<any>(activeRun?.raw_extracted_json, null);
 
     res.json({
       invoice,
@@ -1208,8 +1304,8 @@ export function createApiRouter(): express.Router {
   router.get('/invoices/:invoiceId/document', requireAuth, async (req, res) => {
     const db = getDb();
     const inv = db
-      .prepare('SELECT original_filename, storage_key FROM invoices WHERE id = ?')
-      .get(req.params.invoiceId) as { original_filename: string; storage_key: string } | undefined;
+      .prepare('SELECT id, original_filename, storage_key FROM invoices WHERE id = ?')
+      .get(req.params.invoiceId) as { id: string; original_filename: string; storage_key: string } | undefined;
 
     if (!inv) {
       sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
@@ -1217,9 +1313,19 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      const buf = await readStoredPdf(inv.storage_key);
+      let buf: Buffer;
+      try {
+        buf = await readStoredPdf(inv.storage_key);
+      } catch {
+        const regenerated = await regenerateSeededInvoicePdfIfMissing(inv.id);
+        if (!regenerated) throw new Error('DOCUMENT_MISSING');
+        buf = regenerated;
+      }
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="${inv.original_filename.replace(/"/g, '')}"`);
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="${sanitizeHeaderFilename(inv.original_filename)}"`
+      );
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Cache-Control', 'private, max-age=300');
       res.send(buf);
@@ -1308,8 +1414,18 @@ export function createApiRouter(): express.Router {
   router.post('/invoices/:invoiceId/retry', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
     const inv = db
-      .prepare('SELECT id, processing_status FROM invoices WHERE id = ?')
-      .get(req.params.invoiceId) as { id: string; processing_status: string } | undefined;
+      .prepare(
+        'SELECT id, processing_status, purchase_order_id, total_amount, po_consumed_applied FROM invoices WHERE id = ?'
+      )
+      .get(req.params.invoiceId) as
+      | {
+          id: string;
+          processing_status: string;
+          purchase_order_id: string | null;
+          total_amount: string | null;
+          po_consumed_applied: number;
+        }
+      | undefined;
     if (!inv) {
       sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
       return;
@@ -1319,22 +1435,58 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const lastRun = db
-      .prepare('SELECT MAX(run_number) AS max_num FROM processing_runs WHERE invoice_id = ?')
-      .get(inv.id) as { max_num: number | null };
-    const nextRunNumber = (lastRun?.max_num ?? 0) + 1;
     const newRunId = crypto.randomUUID();
     const now = isoNow();
 
-    db.exec('BEGIN IMMEDIATE;');
-    try {
+    const nextRunNumber = withTransaction(db, () => {
+      // Reverse prior PO consumption if this invoice previously debited a PO so retry evaluates cleanly
+      if (inv.po_consumed_applied === 1 && inv.purchase_order_id && inv.total_amount) {
+        const totalDec = parseDecimalSafe(inv.total_amount);
+        const po = db
+          .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
+          .get(inv.purchase_order_id) as
+          | { id: string; original_amount: string; consumed_amount: string; status: string }
+          | undefined;
+        if (po && totalDec && totalDec.gt(0) && po.status !== 'CANCELLED' && po.status !== 'CLOSED') {
+          const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+          const currConsumed = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
+          const nextConsumed = Decimal.max(new Decimal(0), currConsumed.minus(totalDec));
+          const nextPoStatus = nextConsumed.gte(orig)
+            ? 'FULLY_CONSUMED'
+            : nextConsumed.gt(0)
+              ? 'PARTIALLY_CONSUMED'
+              : 'OPEN';
+          db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
+            nextConsumed.toFixed(4),
+            nextPoStatus,
+            now,
+            po.id
+          );
+        }
+      }
+
+      const lastRun = db
+        .prepare('SELECT MAX(run_number) AS max_num FROM processing_runs WHERE invoice_id = ?')
+        .get(inv.id) as { max_num: number | null };
+      const runNumber = (lastRun?.max_num ?? 0) + 1;
+
       db.prepare(
         `INSERT INTO processing_runs (id, invoice_id, run_number, trigger_type, triggered_by, status, current_stage, created_at)
          VALUES (?, ?, ?, 'RETRY', ?, 'QUEUED', 0, ?)`
-      ).run(newRunId, inv.id, nextRunNumber, req.user!.id, now);
+      ).run(newRunId, inv.id, runNumber, req.user!.id, now);
 
       db.prepare(
-        `UPDATE invoices SET processing_status = 'QUEUED', latest_run_id = ?, updated_at = ? WHERE id = ?`
+        `UPDATE invoices SET
+           processing_status = 'QUEUED',
+           business_decision = 'PENDING',
+           review_status = 'NOT_REQUIRED',
+           vendor_id = NULL,
+           purchase_order_id = NULL,
+           po_consumed_applied = 0,
+           latest_run_id = ?,
+           latest_decision_id = NULL,
+           updated_at = ?
+         WHERE id = ?`
       ).run(newRunId, now, inv.id);
 
       writeAuditLog({
@@ -1344,14 +1496,11 @@ export function createApiRouter(): express.Router {
         action: 'RUN_RETRIED',
         resourceType: 'INVOICE',
         resourceId: inv.id,
-        details: { new_run_id: newRunId, run_number: nextRunNumber, reason: req.body?.reason ?? 'Manual retry' },
+        details: { new_run_id: newRunId, run_number: runNumber, reason: req.body?.reason ?? 'Manual retry' },
       });
 
-      db.exec('COMMIT;');
-    } catch (err) {
-      db.exec('ROLLBACK;');
-      throw err;
-    }
+      return runNumber;
+    });
 
     const p = startProcessingRun(newRunId);
     if (config.isServerless) {
@@ -1375,8 +1524,8 @@ export function createApiRouter(): express.Router {
   router.get('/runs', requireAuth, (req, res) => {
     const db = getDb();
     const status = String(req.query.status ?? '').trim();
-    const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 25)));
+    const page = parsePositiveInt(req.query.page, 1, 10_000);
+    const pageSize = parsePositiveInt(req.query.page_size, 25, 100);
 
     const where = status && status !== 'ALL' ? 'WHERE r.status = ?' : '';
     const params = status && status !== 'ALL' ? [status] : [];
@@ -1410,7 +1559,7 @@ export function createApiRouter(): express.Router {
     }
     const events = (
       db.prepare('SELECT * FROM stage_events WHERE run_id = ? ORDER BY id ASC').all(run.id) as any[]
-    ).map((ev) => ({ ...ev, evidence: JSON.parse(ev.evidence_json || '{}') }));
+    ).map((ev) => ({ ...ev, evidence: safeJsonParse<Record<string, unknown>>(ev.evidence_json, {}) }));
     res.json({ run, stage_events: events });
   });
 
@@ -1431,6 +1580,7 @@ export function createApiRouter(): express.Router {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+    safeSseWrite(res, 'retry: 3000\n\n');
 
     const lastEventIdHeader = req.header('Last-Event-ID') || String(req.query.lastEventId ?? '0');
     let lastSentId = Number.parseInt(lastEventIdHeader, 10) || 0;
@@ -1440,72 +1590,87 @@ export function createApiRouter(): express.Router {
         return;
       }
       lastSentId = Math.max(lastSentId, payload.id);
-      res.write(`id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
+      safeSseWrite(res, `id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
     };
 
-    // 1. Replay missed persisted events from DB
-    const missed = db
-      .prepare('SELECT * FROM stage_events WHERE run_id = ? AND id > ? ORDER BY id ASC')
-      .all(runId, lastSentId) as any[];
+    const replayAndCheckTerminal = (): boolean => {
+      const missed = db
+        .prepare('SELECT * FROM stage_events WHERE run_id = ? AND id > ? ORDER BY id ASC')
+        .all(runId, lastSentId) as any[];
 
-    for (const ev of missed) {
-      const evType =
-        ev.status === 'STARTED'
-          ? 'stage_started'
-          : ev.status === 'FAILED'
-            ? 'stage_failed'
-            : 'stage_completed';
-      writeSse({
-        id: ev.id,
-        event: evType,
-        data: {
+      for (const ev of missed) {
+        const evType =
+          ev.status === 'STARTED'
+            ? 'stage_started'
+            : ev.status === 'FAILED'
+              ? 'stage_failed'
+              : 'stage_completed';
+        writeSse({
           id: ev.id,
-          run_id: ev.run_id,
-          stage_number: ev.stage_number,
-          stage_code: ev.stage_code,
-          status: ev.status,
-          summary: ev.summary,
-          duration_ms: ev.duration_ms,
-          evidence: JSON.parse(ev.evidence_json || '{}'),
-          timestamp: ev.created_at,
-        },
-      });
-    }
+          event: evType,
+          data: {
+            id: ev.id,
+            run_id: ev.run_id,
+            stage_number: ev.stage_number,
+            stage_code: ev.stage_code,
+            status: ev.status,
+            summary: ev.summary,
+            duration_ms: ev.duration_ms,
+            evidence: safeJsonParse<Record<string, unknown>>(ev.evidence_json, {}),
+            timestamp: ev.created_at,
+          },
+        });
+      }
 
-    // Re-check terminal status immediately after replay
-    const currentRun = db
-      .prepare('SELECT status, error_stage, error_message, duration_ms FROM processing_runs WHERE id = ?')
-      .get(runId) as { status: string; error_stage: number | null; error_message: string | null; duration_ms: number | null };
+      const currentRun = db
+        .prepare('SELECT status, error_stage, error_message, duration_ms FROM processing_runs WHERE id = ?')
+        .get(runId) as
+        | { status: string; error_stage: number | null; error_message: string | null; duration_ms: number | null }
+        | undefined;
 
-    if (currentRun.status === 'COMPLETED') {
-      const inv = db
-        .prepare('SELECT business_decision, review_status FROM invoices WHERE id = ?')
-        .get(run.invoice_id) as { business_decision: string; review_status: string };
-      res.write(
-        `id: ${lastSentId + 1}\nevent: run_completed\ndata: ${JSON.stringify({
-          run_id: runId,
-          invoice_id: run.invoice_id,
-          processing_status: 'COMPLETED',
-          business_decision: inv.business_decision,
-          review_status: inv.review_status,
-          duration_ms: currentRun.duration_ms,
-        })}\n\n`
-      );
-      res.end();
-      return;
-    }
+      if (!currentRun) {
+        if (!res.writableEnded) res.end();
+        return true;
+      }
 
-    if (currentRun.status === 'FAILED') {
-      res.write(
-        `id: ${lastSentId + 1}\nevent: run_failed\ndata: ${JSON.stringify({
-          run_id: runId,
-          invoice_id: run.invoice_id,
-          processing_status: 'FAILED',
-          error_stage: currentRun.error_stage,
-          error_message: currentRun.error_message,
-        })}\n\n`
-      );
-      res.end();
+      if (currentRun.status === 'COMPLETED') {
+        const inv = db
+          .prepare('SELECT business_decision, review_status FROM invoices WHERE id = ?')
+          .get(run.invoice_id) as { business_decision: string; review_status: string } | undefined;
+        safeSseWrite(
+          res,
+          `id: ${lastSentId + 1}\nevent: run_completed\ndata: ${JSON.stringify({
+            run_id: runId,
+            invoice_id: run.invoice_id,
+            processing_status: 'COMPLETED',
+            business_decision: inv?.business_decision ?? 'PENDING',
+            review_status: inv?.review_status ?? 'NOT_REQUIRED',
+            duration_ms: currentRun.duration_ms,
+          })}\n\n`
+        );
+        if (!res.writableEnded) res.end();
+        return true;
+      }
+
+      if (currentRun.status === 'FAILED') {
+        safeSseWrite(
+          res,
+          `id: ${lastSentId + 1}\nevent: run_failed\ndata: ${JSON.stringify({
+            run_id: runId,
+            invoice_id: run.invoice_id,
+            processing_status: 'FAILED',
+            error_stage: currentRun.error_stage,
+            error_message: currentRun.error_message,
+          })}\n\n`
+        );
+        if (!res.writableEnded) res.end();
+        return true;
+      }
+
+      return false;
+    };
+
+    if (replayAndCheckTerminal()) {
       return;
     }
 
@@ -1513,16 +1678,36 @@ export function createApiRouter(): express.Router {
       writeSse(payload);
       if (payload.event === 'run_completed' || payload.event === 'run_failed') {
         cleanup();
-        res.end();
+        if (!res.writableEnded) res.end();
       }
     };
 
     const heartbeat = setInterval(() => {
-      res.write(': heartbeat\n\n');
+      if (!safeSseWrite(res, ': heartbeat\n\n')) {
+        cleanup();
+      }
     }, 15000);
+
+    const dbPoll = config.isServerless
+      ? setInterval(() => {
+          if (replayAndCheckTerminal()) {
+            cleanup();
+          }
+        }, 1500)
+      : null;
+
+    // Gracefully end SSE before Vercel's 60s maxDuration so EventSource reconnects cleanly
+    const serverlessMaxLifetime = config.isServerless
+      ? setTimeout(() => {
+          cleanup();
+          if (!res.writableEnded) res.end();
+        }, 45_000)
+      : null;
 
     const cleanup = () => {
       clearInterval(heartbeat);
+      if (dbPoll) clearInterval(dbPoll);
+      if (serverlessMaxLifetime) clearTimeout(serverlessMaxLifetime);
       sseBroker.off(`run:${runId}`, onEvent);
     };
 
@@ -1562,14 +1747,8 @@ export function createApiRouter(): express.Router {
     const mapped = rows
       .map((r) => ({
         ...r,
-        triggered_rules: r.triggered_rules ? JSON.parse(r.triggered_rules) : [],
-        explanation_details: (() => {
-          try {
-            return JSON.parse(r.explanation_json || '{}');
-          } catch {
-            return {};
-          }
-        })(),
+        triggered_rules: safeJsonParse<any[]>(r.triggered_rules, []),
+        explanation_details: safeJsonParse<Record<string, unknown>>(r.explanation_json, {}),
       }))
       .filter((r) => {
         if (category === 'ALL') return true;
@@ -1587,28 +1766,65 @@ export function createApiRouter(): express.Router {
 
   router.post('/reviews/:invoiceId/assign', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
     const db = getDb();
-    const reviewerId = String(req.body?.reviewer_id || req.user!.id);
+    const reviewerId = String(req.body?.reviewer_id || req.user!.id).trim();
+    const targetReviewer = db
+      .prepare('SELECT id, full_name, role, is_active FROM users WHERE id = ?')
+      .get(reviewerId) as { id: string; full_name: string; role: string; is_active: number } | undefined;
+
+    if (!targetReviewer || targetReviewer.is_active !== 1 || !['REVIEWER', 'ADMIN'].includes(targetReviewer.role)) {
+      sendError(
+        req,
+        res,
+        422,
+        'VALIDATION_ERROR',
+        'Assigned reviewer must be an active user with REVIEWER or ADMIN role.'
+      );
+      return;
+    }
+
     const inv = db
       .prepare('SELECT id, latest_decision_id, review_status FROM invoices WHERE id = ?')
       .get(req.params.invoiceId) as { id: string; latest_decision_id: string | null; review_status: string } | undefined;
 
-    if (!inv || !inv.latest_decision_id) {
-      sendError(req, res, 404, 'NOT_FOUND', 'Invoice or decision not found.');
+    if (!inv) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
+      return;
+    }
+    if (!inv.latest_decision_id || inv.review_status !== 'PENDING_REVIEW') {
+      sendError(
+        req,
+        res,
+        409,
+        'INVALID_STATE',
+        `Only PENDING_REVIEW invoices can be assigned (current status: ${inv.review_status}).`
+      );
       return;
     }
 
     const now = isoNow();
-    db.prepare('UPDATE invoices SET assigned_reviewer_id = ?, updated_at = ? WHERE id = ?').run(
-      reviewerId,
-      now,
-      inv.id
-    );
-    db.prepare(
-      `INSERT INTO review_actions (id, invoice_id, decision_id, reviewer_id, action, note, created_at)
-       VALUES (?, ?, ?, ?, 'ASSIGN', ?, ?)`
-    ).run(crypto.randomUUID(), inv.id, inv.latest_decision_id, req.user!.id, `Assigned reviewer ${reviewerId}`, now);
+    withTransaction(db, () => {
+      db.prepare('UPDATE invoices SET assigned_reviewer_id = ?, updated_at = ? WHERE id = ?').run(
+        reviewerId,
+        now,
+        inv.id
+      );
+      db.prepare(
+        `INSERT INTO review_actions (id, invoice_id, decision_id, reviewer_id, action, note, created_at)
+         VALUES (?, ?, ?, ?, 'ASSIGN', ?, ?)`
+      ).run(crypto.randomUUID(), inv.id, inv.latest_decision_id, req.user!.id, `Assigned reviewer ${targetReviewer.full_name}`, now);
 
-    res.json({ ok: true, assigned_reviewer_id: reviewerId });
+      writeAuditLog({
+        actorId: req.user!.id,
+        actorType: 'USER',
+        actorRole: req.user!.role,
+        action: 'REVIEW_ASSIGNED',
+        resourceType: 'INVOICE',
+        resourceId: inv.id,
+        details: { assigned_reviewer_id: reviewerId, assigned_reviewer_name: targetReviewer.full_name },
+      });
+    });
+
+    res.json({ ok: true, assigned_reviewer_id: reviewerId, assigned_reviewer_name: targetReviewer.full_name });
   });
 
   router.post('/invoices/:invoiceId/review', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
@@ -1643,14 +1859,19 @@ export function createApiRouter(): express.Router {
         )
         .get(req.params.invoiceId) as any;
 
-      if (!inv || !inv.latest_decision_id) {
-        db.exec('ROLLBACK;');
+      if (!inv) {
+        safeRollback(db);
         sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
+        return;
+      }
+      if (!inv.latest_decision_id) {
+        safeRollback(db);
+        sendError(req, res, 409, 'INVALID_STATE', 'Invoice has not completed automated processing yet.');
         return;
       }
 
       if (inv.review_status !== 'PENDING_REVIEW') {
-        db.exec('ROLLBACK;');
+        safeRollback(db);
         sendError(
           req,
           res,
@@ -1668,7 +1889,7 @@ export function createApiRouter(): express.Router {
         | undefined;
 
       if ((policySettings?.enforce_separation_of_duties ?? 1) === 1 && inv.uploaded_by === req.user!.id) {
-        db.exec('ROLLBACK;');
+        safeRollback(db);
         sendError(
           req,
           res,
@@ -1680,16 +1901,11 @@ export function createApiRouter(): express.Router {
         return;
       }
 
-      if (
-        action === 'APPROVE_OVERRIDE' &&
-        req.user!.role === 'REVIEWER' &&
-        policySettings?.reviewer_approval_limit &&
-        inv.total_amount
-      ) {
-        const limitDec = new Decimal(policySettings.reviewer_approval_limit);
-        const totalDec = new Decimal(inv.total_amount);
+      const limitDec = parseDecimalSafe(policySettings?.reviewer_approval_limit);
+      const totalDec = parseDecimalSafe(inv.total_amount);
+      if (action === 'APPROVE_OVERRIDE' && req.user!.role === 'REVIEWER' && limitDec && totalDec) {
         if (totalDec.gt(limitDec)) {
-          db.exec('ROLLBACK;');
+          safeRollback(db);
           sendError(
             req,
             res,
@@ -1708,14 +1924,24 @@ export function createApiRouter(): express.Router {
       const newReviewStatus = action === 'APPROVE_OVERRIDE' ? 'APPROVED_BY_HUMAN' : 'REJECTED_BY_HUMAN';
 
       // Atomic PO debit on human approval if not already applied
-      if (action === 'APPROVE_OVERRIDE' && inv.purchase_order_id && inv.po_consumed_applied === 0 && inv.total_amount) {
+      if (action === 'APPROVE_OVERRIDE' && inv.purchase_order_id && inv.po_consumed_applied === 0 && totalDec) {
         const po = db
-          .prepare('SELECT id, original_amount, consumed_amount FROM purchase_orders WHERE id = ?')
-          .get(inv.purchase_order_id) as { id: string; original_amount: string; consumed_amount: string } | undefined;
-        if (po) {
-          const orig = new Decimal(po.original_amount);
-          const newConsumed = new Decimal(po.consumed_amount).plus(new Decimal(inv.total_amount));
-          const newPoStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
+          .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
+          .get(inv.purchase_order_id) as
+          | { id: string; original_amount: string; consumed_amount: string; status: string }
+          | undefined;
+        if (po && po.status !== 'CANCELLED') {
+          const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+          const currConsumed = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
+          const newConsumed = Decimal.max(new Decimal(0), currConsumed.plus(totalDec));
+          const newPoStatus =
+            po.status === 'CLOSED'
+              ? 'CLOSED'
+              : newConsumed.gte(orig)
+                ? 'FULLY_CONSUMED'
+                : newConsumed.gt(0)
+                  ? 'PARTIALLY_CONSUMED'
+                  : 'OPEN';
           db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
             newConsumed.toFixed(4),
             newPoStatus,
@@ -1770,7 +1996,7 @@ export function createApiRouter(): express.Router {
         review_action_id: actionId,
       });
     } catch (err) {
-      db.exec('ROLLBACK;');
+      safeRollback(db);
       throw err;
     }
   });
@@ -1814,8 +2040,8 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const triggeredRules = JSON.parse(decisionRow.triggered_rules || '[]');
-    const evidenceSnapshot = JSON.parse(decisionRow.evidence_snapshot || '{}');
+    const triggeredRules = safeJsonParse<any[]>(decisionRow.triggered_rules, []);
+    const evidenceSnapshot = safeJsonParse<Record<string, any>>(decisionRow.evidence_snapshot, {});
     const deterministicSummary =
       typeof evidenceSnapshot.deterministic_rule_summary === 'string' &&
       evidenceSnapshot.deterministic_rule_summary.trim()
@@ -1842,10 +2068,9 @@ export function createApiRouter(): express.Router {
         currency: string;
       }>;
       candidatePos = openPos.map((po) => {
-        const rem = Decimal.max(
-          new Decimal(0),
-          new Decimal(po.original_amount).minus(new Decimal(po.consumed_amount))
-        );
+        const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+        const cons = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
+        const rem = Decimal.max(new Decimal(0), orig.minus(cons));
         return {
           po_number: po.po_number,
           remaining_amount: rem.toFixed(2),
@@ -1884,6 +2109,26 @@ export function createApiRouter(): express.Router {
         throwOnError: true,
       });
 
+      const explanationRecord = buildExplanationRecord({
+        input: {
+          outcome: decisionRow.outcome,
+          primaryReasonCode: decisionRow.primary_reason_code,
+          triggeredRules,
+          evidenceSnapshot,
+          invoice: {
+            filename: inv.original_filename,
+            vendor: inv.vendor_canonical_name || inv.extracted_vendor_name || null,
+            invoiceNumber: inv.invoice_number || null,
+            currency: inv.currency || null,
+            subtotal: inv.subtotal_amount || null,
+            tax: inv.tax_amount || null,
+            total: inv.total_amount || null,
+            purchaseOrder: inv.matched_po_number || inv.extracted_po_number || null,
+          },
+        },
+        aiExplanation: result,
+      });
+
       const aiReviewerBrief =
         decisionRow.outcome !== 'APPROVE'
           ? {
@@ -1905,9 +2150,34 @@ export function createApiRouter(): express.Router {
         updatedSnapshot.ai_reviewer_brief = aiReviewerBrief;
       }
 
-      db.prepare('UPDATE decisions SET explanation = ?, evidence_snapshot = ? WHERE id = ?').run(
+      db.prepare(
+        `UPDATE decisions SET
+           explanation = ?,
+           evidence_snapshot = ?,
+           explanation_source = ?,
+           explanation_provider = ?,
+           explanation_model = ?,
+           explanation_prompt_version = ?,
+           explanation_status = ?,
+           explanation_generated_at = ?,
+           explanation_input_tokens = ?,
+           explanation_output_tokens = ?,
+           explanation_fallback_reason = ?,
+           explanation_json = ?
+         WHERE id = ?`
+      ).run(
         result.explanation,
         JSON.stringify(updatedSnapshot),
+        explanationRecord.explanation_source,
+        explanationRecord.explanation_provider,
+        explanationRecord.explanation_model,
+        explanationRecord.prompt_version,
+        explanationRecord.generation_status,
+        explanationRecord.generated_at,
+        explanationRecord.token_usage.input,
+        explanationRecord.token_usage.output,
+        explanationRecord.fallback_reason,
+        JSON.stringify(explanationRecord),
         decisionRow.id
       );
 
@@ -1932,6 +2202,7 @@ export function createApiRouter(): express.Router {
         explanation: result.explanation,
         ai_decision_explanation: result,
         ai_reviewer_brief: aiReviewerBrief,
+        explanation_details: explanationRecord,
       });
     } catch (err) {
       if (err instanceof GeminiConfigurationError) {
@@ -2042,8 +2313,8 @@ export function createApiRouter(): express.Router {
         ? req.body.body_template.trim().slice(0, 4000)
         : appSettings?.rejection_email_body_template || null;
 
-    const triggeredRules = JSON.parse(decisionRow.triggered_rules || '[]');
-    const evidenceSnapshot = JSON.parse(decisionRow.evidence_snapshot || '{}');
+    const triggeredRules = safeJsonParse<any[]>(decisionRow.triggered_rules, []);
+    const evidenceSnapshot = safeJsonParse<Record<string, any>>(decisionRow.evidence_snapshot, {});
 
     try {
       const draft = await generateRejectionNoticeDraft({
@@ -2144,7 +2415,7 @@ export function createApiRouter(): express.Router {
     const items = rows
       .map((v) => ({
         ...v,
-        aliases: JSON.parse(v.aliases || '[]'),
+        aliases: safeJsonParse<string[]>(v.aliases, []),
       }))
       .filter((v) => {
         if (status && status !== 'ALL' && v.verification_status !== status) return false;
@@ -2280,8 +2551,8 @@ export function createApiRouter(): express.Router {
         notes_or_filename: `Aliases: ${summary?.aliases || 'None'}`,
       },
       ...purchaseOrders.map((po) => {
-        const orig = new Decimal(po.original_amount);
-        const cons = new Decimal(po.consumed_amount);
+        const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+        const cons = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
         const util = orig.gt(0) ? cons.div(orig).mul(100).toFixed(1) : '0.0';
         return {
           record_type: 'PURCHASE_ORDER',
@@ -2328,7 +2599,7 @@ export function createApiRouter(): express.Router {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="invoicedesk_vendor_${safeCode}_${isoNow().slice(0, 10)}.csv"`
+      `attachment; filename="${sanitizeHeaderFilename(`invoicedesk_vendor_${safeCode}_${isoNow().slice(0, 10)}.csv`)}"`
     );
     res.send(csv);
   });
@@ -2350,37 +2621,72 @@ export function createApiRouter(): express.Router {
       )
       .all(vendor.id);
     res.json({
-      vendor: { ...vendor, aliases: JSON.parse(vendor.aliases || '[]') },
+      vendor: { ...vendor, aliases: safeJsonParse<string[]>(vendor.aliases, []) },
       purchase_orders: purchaseOrders,
       invoices,
     });
   });
 
   router.post('/vendors', requireAuth, requireRoles('ADMIN'), (req, res) => {
-    const { canonical_name, aliases, tax_id, default_currency, verification_status } = req.body ?? {};
-    if (!canonical_name?.trim()) {
+    const { canonical_name, aliases, tax_id, default_currency, verification_status, payment_terms_days } = req.body ?? {};
+    const trimmedName = typeof canonical_name === 'string' ? canonical_name.trim() : '';
+    if (!trimmedName) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'canonical_name is required.');
       return;
     }
+
+    const currencyCode = String(default_currency || 'USD').trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(currencyCode)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'default_currency must be a 3-letter ISO currency code.');
+      return;
+    }
+
+    const status = verification_status === undefined ? 'UNVERIFIED' : String(verification_status).toUpperCase();
+    if (!['APPROVED', 'UNVERIFIED', 'BLOCKED'].includes(status)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'verification_status must be APPROVED, UNVERIFIED, or BLOCKED.');
+      return;
+    }
+
+    const terms = payment_terms_days === undefined ? 30 : Number(payment_terms_days);
+    if (!Number.isInteger(terms) || terms < 0 || terms > 365) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'payment_terms_days must be an integer between 0 and 365.');
+      return;
+    }
+
     const db = getDb();
-    const count = (db.prepare('SELECT COUNT(*) AS c FROM vendors').get() as { c: number }).c;
-    const vendorCode = `V-${String(count + 1).padStart(3, '0')}`;
+    const existingCodes = db.prepare('SELECT vendor_code FROM vendors').all() as Array<{ vendor_code: string }>;
+    let maxNum = 0;
+    const usedCodes = new Set<string>();
+    for (const row of existingCodes) {
+      usedCodes.add(row.vendor_code);
+      const m = row.vendor_code.match(/^V-(\d+)$/i);
+      if (m) maxNum = Math.max(maxNum, Number(m[1]));
+    }
+    let nextNum = maxNum + 1;
+    let vendorCode = `V-${String(nextNum).padStart(3, '0')}`;
+    while (usedCodes.has(vendorCode)) {
+      nextNum++;
+      vendorCode = `V-${String(nextNum).padStart(3, '0')}`;
+    }
+
     const id = crypto.randomUUID();
     const now = isoNow();
     const aliasArr = Array.isArray(aliases) ? aliases.map((a) => String(a).trim()).filter(Boolean) : [];
+    const normName = normalizeVendorName(trimmedName) || trimmedName.toLowerCase();
 
     db.prepare(
-      `INSERT INTO vendors (id, vendor_code, canonical_name, normalized_name, aliases, tax_id, default_currency, verification_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO vendors (id, vendor_code, canonical_name, normalized_name, aliases, tax_id, default_currency, verification_status, payment_terms_days, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       vendorCode,
-      canonical_name.trim(),
-      normalizeVendorName(canonical_name),
+      trimmedName,
+      normName,
       JSON.stringify(aliasArr),
-      tax_id?.trim() || null,
-      (default_currency || 'USD').toUpperCase(),
-      ['APPROVED', 'UNVERIFIED', 'BLOCKED'].includes(verification_status) ? verification_status : 'UNVERIFIED',
+      typeof tax_id === 'string' && tax_id.trim() ? tax_id.trim() : null,
+      currencyCode,
+      status,
+      terms,
       now,
       now
     );
@@ -2392,7 +2698,7 @@ export function createApiRouter(): express.Router {
       action: 'VENDOR_CREATED',
       resourceType: 'VENDOR',
       resourceId: id,
-      details: { canonical_name, vendor_code: vendorCode },
+      details: { canonical_name: trimmedName, vendor_code: vendorCode },
     });
 
     res.status(201).json({ id, vendor_code: vendorCode });
@@ -2412,15 +2718,40 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const nextStatus = verification_status ?? existing.verification_status;
-    const nextAliases = Array.isArray(aliases) ? JSON.stringify(aliases) : existing.aliases;
-    const nextName = canonical_name ? String(canonical_name).trim() : existing.canonical_name;
-    const nextTax = tax_id !== undefined ? tax_id : existing.tax_id;
+    const nextStatus =
+      verification_status !== undefined ? String(verification_status).toUpperCase() : existing.verification_status;
+    if (!['APPROVED', 'UNVERIFIED', 'BLOCKED'].includes(nextStatus)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'verification_status must be APPROVED, UNVERIFIED, or BLOCKED.');
+      return;
+    }
+
+    let nextName = existing.canonical_name;
+    if (canonical_name !== undefined) {
+      const trimmed = String(canonical_name).trim();
+      if (!trimmed) {
+        sendError(req, res, 422, 'VALIDATION_ERROR', 'canonical_name cannot be empty.');
+        return;
+      }
+      nextName = trimmed;
+    }
+
+    const nextAliases = Array.isArray(aliases)
+      ? JSON.stringify(aliases.map((a) => String(a).trim()).filter(Boolean))
+      : existing.aliases;
+    const nextTax = tax_id !== undefined ? (tax_id ? String(tax_id).trim() : null) : existing.tax_id;
     const now = isoNow();
 
     db.prepare(
       `UPDATE vendors SET canonical_name = ?, normalized_name = ?, aliases = ?, tax_id = ?, verification_status = ?, updated_at = ? WHERE id = ?`
-    ).run(nextName, normalizeVendorName(nextName), nextAliases, nextTax, nextStatus, now, existing.id);
+    ).run(
+      nextName,
+      normalizeVendorName(nextName) || nextName.toLowerCase(),
+      nextAliases,
+      nextTax,
+      nextStatus,
+      now,
+      existing.id
+    );
 
     writeAuditLog({
       actorId: req.user!.id,
@@ -2456,8 +2787,8 @@ export function createApiRouter(): express.Router {
 
     const mapped = rows
       .map((po) => {
-        const orig = new Decimal(po.original_amount);
-        const cons = new Decimal(po.consumed_amount);
+        const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+        const cons = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
         const rem = Decimal.max(new Decimal(0), orig.minus(cons));
         const utilPct = orig.gt(0) ? cons.div(orig).mul(100).toNumber() : 0;
         return {
@@ -2473,7 +2804,7 @@ export function createApiRouter(): express.Router {
       })
       .sort((a, b) => {
         if (sort === 'utilization_desc') return b.utilization_pct - a.utilization_pct;
-        return b.issued_date.localeCompare(a.issued_date);
+        return String(b.issued_date || '').localeCompare(String(a.issued_date || ''));
       });
 
     res.json({ items: mapped, total: mapped.length });
@@ -2504,8 +2835,8 @@ export function createApiRouter(): express.Router {
       )
       .all(po.id);
 
-    const orig = new Decimal(po.original_amount);
-    const cons = new Decimal(po.consumed_amount);
+    const orig = parseDecimalSafe(po.original_amount) ?? new Decimal(0);
+    const cons = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
     res.json({
       purchase_order: {
         ...po,
@@ -2519,67 +2850,103 @@ export function createApiRouter(): express.Router {
 
   router.post('/purchase-orders', requireAuth, requireRoles('ADMIN'), (req, res) => {
     const { po_number, vendor_id, currency, original_amount, issued_date, notes, lines } = req.body ?? {};
-    if (!po_number?.trim() || !vendor_id || !original_amount) {
+    const poNumStr = typeof po_number === 'string' ? po_number.trim() : '';
+    const vendorIdStr = typeof vendor_id === 'string' ? vendor_id.trim() : '';
+    if (!poNumStr || !vendorIdStr || original_amount === undefined || original_amount === null || original_amount === '') {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'po_number, vendor_id, and original_amount are required.');
       return;
     }
-    const origDec = new Decimal(String(original_amount));
-    if (origDec.lte(0)) {
-      sendError(req, res, 422, 'VALIDATION_ERROR', 'original_amount must be positive.');
+    const origDec = parseDecimalSafe(String(original_amount));
+    if (!origDec || origDec.lte(0)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'original_amount must be a positive number.');
+      return;
+    }
+    const currencyCode = String(currency || 'USD').trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(currencyCode)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'currency must be a 3-letter ISO currency code.');
       return;
     }
 
     const db = getDb();
-    const id = crypto.randomUUID();
-    const now = isoNow();
-    const normPo = normalizeDocNumber(po_number) || po_number.toUpperCase();
-
-    db.prepare(
-      `INSERT INTO purchase_orders (id, po_number, normalized_po_number, vendor_id, currency, original_amount, consumed_amount, status, issued_date, notes, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, '0.0000', 'OPEN', ?, ?, ?, ?)`
-    ).run(
-      id,
-      po_number.trim(),
-      normPo,
-      vendor_id,
-      (currency || 'USD').toUpperCase(),
-      origDec.toFixed(4),
-      issued_date || now.slice(0, 10),
-      notes || null,
-      now,
-      now
-    );
-
-    if (Array.isArray(lines)) {
-      lines.forEach((l: any, idx: number) => {
-        const qty = new Decimal(String(l.quantity || 1));
-        const unit = new Decimal(String(l.unit_price || origDec.toFixed(2)));
-        db.prepare(
-          `INSERT INTO purchase_order_lines (id, purchase_order_id, line_number, description, quantity, unit_price, line_total)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          crypto.randomUUID(),
-          id,
-          idx + 1,
-          String(l.description || 'Line Item'),
-          qty.toFixed(4),
-          unit.toFixed(4),
-          qty.mul(unit).toFixed(4)
-        );
-      });
+    const vendorExists = db.prepare('SELECT id FROM vendors WHERE id = ?').get(vendorIdStr);
+    if (!vendorExists) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'Referenced vendor_id does not exist.');
+      return;
     }
 
-    writeAuditLog({
-      actorId: req.user!.id,
-      actorType: 'USER',
-      actorRole: req.user!.role,
-      action: 'PO_CREATED',
-      resourceType: 'PURCHASE_ORDER',
-      resourceId: id,
-      details: { po_number, original_amount: origDec.toFixed(2) },
-    });
+    const id = crypto.randomUUID();
+    const now = isoNow();
+    const normPo = normalizeDocNumber(poNumStr) || poNumStr.toUpperCase();
 
-    res.status(201).json({ id, po_number });
+    const parsedLines: Array<{ description: string; qty: Decimal; unit: Decimal }> = [];
+    if (Array.isArray(lines)) {
+      for (const l of lines) {
+        const qty = parseDecimalSafe(l?.quantity !== undefined ? String(l.quantity) : '1');
+        const unit = parseDecimalSafe(l?.unit_price !== undefined ? String(l.unit_price) : origDec.toFixed(2));
+        if (!qty || !unit || qty.lte(0) || unit.lt(0)) {
+          sendError(req, res, 422, 'VALIDATION_ERROR', 'PO line items must have valid numeric quantity (> 0) and unit_price (>= 0).');
+          return;
+        }
+        parsedLines.push({
+          description: String(l?.description || 'Line Item').trim() || 'Line Item',
+          qty,
+          unit,
+        });
+      }
+    }
+
+    try {
+      withTransaction(db, () => {
+        db.prepare(
+          `INSERT INTO purchase_orders (id, po_number, normalized_po_number, vendor_id, currency, original_amount, consumed_amount, status, issued_date, notes, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, '0.0000', 'OPEN', ?, ?, ?, ?)`
+        ).run(
+          id,
+          poNumStr,
+          normPo,
+          vendorIdStr,
+          currencyCode,
+          origDec.toFixed(4),
+          typeof issued_date === 'string' && issued_date.trim() ? issued_date.trim().slice(0, 10) : now.slice(0, 10),
+          notes ? String(notes) : null,
+          now,
+          now
+        );
+
+        parsedLines.forEach((l, idx) => {
+          db.prepare(
+            `INSERT INTO purchase_order_lines (id, purchase_order_id, line_number, description, quantity, unit_price, line_total)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            crypto.randomUUID(),
+            id,
+            idx + 1,
+            l.description,
+            l.qty.toFixed(4),
+            l.unit.toFixed(4),
+            l.qty.mul(l.unit).toFixed(4)
+          );
+        });
+
+        writeAuditLog({
+          actorId: req.user!.id,
+          actorType: 'USER',
+          actorRole: req.user!.role,
+          action: 'PO_CREATED',
+          resourceType: 'PURCHASE_ORDER',
+          resourceId: id,
+          details: { po_number: poNumStr, original_amount: origDec.toFixed(2) },
+        });
+      });
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        sendError(req, res, 409, 'DUPLICATE_PO_NUMBER', `Purchase order ${poNumStr} already exists.`);
+        return;
+      }
+      throw err;
+    }
+
+    res.status(201).json({ id, po_number: poNumStr });
   });
 
   router.patch('/purchase-orders/:poId', requireAuth, requireRoles('ADMIN'), (req, res) => {
@@ -2591,19 +2958,36 @@ export function createApiRouter(): express.Router {
     }
 
     const { status, original_amount, notes } = req.body ?? {};
-    const nextOrig = original_amount !== undefined ? new Decimal(String(original_amount)) : new Decimal(po.original_amount);
-    if (nextOrig.lt(new Decimal(po.consumed_amount))) {
+    const nextOrig =
+      original_amount !== undefined ? parseDecimalSafe(String(original_amount)) : parseDecimalSafe(po.original_amount);
+    if (!nextOrig || nextOrig.lte(0)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'original_amount must be a positive number.');
+      return;
+    }
+    const consumedDec = parseDecimalSafe(po.consumed_amount) ?? new Decimal(0);
+    if (nextOrig.lt(consumedDec)) {
       sendError(
         req,
         res,
         422,
         'VALIDATION_ERROR',
-        `Cannot reduce original_amount below already consumed amount ($${new Decimal(po.consumed_amount).toFixed(2)}).`
+        `Cannot reduce original_amount below already consumed amount ($${consumedDec.toFixed(2)}).`
       );
       return;
     }
 
-    const nextStatus = status ?? po.status;
+    const nextStatus = status !== undefined ? String(status).toUpperCase() : po.status;
+    if (!['OPEN', 'PARTIALLY_CONSUMED', 'FULLY_CONSUMED', 'CLOSED', 'CANCELLED'].includes(nextStatus)) {
+      sendError(
+        req,
+        res,
+        422,
+        'VALIDATION_ERROR',
+        'status must be OPEN, PARTIALLY_CONSUMED, FULLY_CONSUMED, CLOSED, or CANCELLED.'
+      );
+      return;
+    }
+
     const now = isoNow();
     db.prepare('UPDATE purchase_orders SET original_amount = ?, status = ?, notes = ?, updated_at = ? WHERE id = ?').run(
       nextOrig.toFixed(4),
@@ -2650,7 +3034,7 @@ export function createApiRouter(): express.Router {
     const trendMap = new Map<string, { date: string; APPROVE: number; REVIEW: number; REJECT: number; FAILED: number }>();
 
     for (const inv of invoices) {
-      const amt = inv.total_amount ? new Decimal(inv.total_amount) : new Decimal(0);
+      const amt = parseDecimalSafe(inv.total_amount) ?? new Decimal(0);
       const day = String(inv.created_at).slice(0, 10);
       if (!trendMap.has(day)) {
         trendMap.set(day, { date: day, APPROVE: 0, REVIEW: 0, REJECT: 0, FAILED: 0 });
@@ -2685,7 +3069,7 @@ export function createApiRouter(): express.Router {
          ORDER BY a.id DESC LIMIT 8`
       )
       .all()
-      .map((a: any) => ({ ...a, details: JSON.parse(a.details_json || '{}') }));
+      .map((a: any) => ({ ...a, details: safeJsonParse<Record<string, unknown>>(a.details_json, {}) }));
 
     res.json({
       window: win,
@@ -2770,8 +3154,8 @@ export function createApiRouter(): express.Router {
     let poOrigTotal = new Decimal(0);
     let poConsTotal = new Decimal(0);
     for (const p of pos) {
-      poOrigTotal = poOrigTotal.plus(p.original_amount);
-      poConsTotal = poConsTotal.plus(p.consumed_amount);
+      poOrigTotal = poOrigTotal.plus(parseDecimalSafe(p.original_amount) ?? 0);
+      poConsTotal = poConsTotal.plus(parseDecimalSafe(p.consumed_amount) ?? 0);
     }
     const poUtilPct = poOrigTotal.gt(0) ? Number(poConsTotal.div(poOrigTotal).mul(100).toFixed(1)) : 0;
 
@@ -2808,7 +3192,7 @@ export function createApiRouter(): express.Router {
   // ==================== GLOBAL SEARCH & NOTIFICATIONS ====================
   router.get('/search', requireAuth, (req, res) => {
     const db = getDb();
-    const q = String(req.query.q ?? '').trim().toLowerCase();
+    const q = String(req.query.q ?? '').trim().slice(0, 120).toLowerCase();
     if (!q) {
       res.json({ invoices: [], purchase_orders: [], vendors: [] });
       return;
@@ -2845,7 +3229,7 @@ export function createApiRouter(): express.Router {
   router.get('/notifications', requireAuth, (req, res) => {
     const type = String(req.query.type ?? 'ALL');
     const unreadOnly = req.query.unread_only === 'true';
-    const limit = Number(req.query.limit || 30);
+    const limit = parsePositiveInt(req.query.limit, 30, 100);
     const data = listNotificationsForUser(req.user!.id, { type, unreadOnly, limit });
     res.json(data);
   });
@@ -2856,6 +3240,7 @@ export function createApiRouter(): express.Router {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+    safeSseWrite(res, 'retry: 15000\n\n');
 
     const lastEventIdHeader = req.header('Last-Event-ID') || String(req.query.lastEventId ?? '0');
     let lastSentId = Number.parseInt(lastEventIdHeader, 10) || 0;
@@ -2864,7 +3249,7 @@ export function createApiRouter(): express.Router {
       const missed = listMissedNotificationsSince(lastSentId);
       for (const item of missed) {
         lastSentId = Math.max(lastSentId, item.id);
-        res.write(`id: ${item.id}\nevent: notification_created\ndata: ${JSON.stringify(item)}\n\n`);
+        safeSseWrite(res, `id: ${item.id}\nevent: notification_created\ndata: ${JSON.stringify(item)}\n\n`);
       }
     }
 
@@ -2873,15 +3258,26 @@ export function createApiRouter(): express.Router {
         if (payload.id <= lastSentId) return;
         lastSentId = Math.max(lastSentId, payload.id);
       }
-      res.write(`id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
+      safeSseWrite(res, `id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
     };
 
     const heartbeat = setInterval(() => {
-      res.write(': heartbeat\n\n');
+      if (!safeSseWrite(res, ': heartbeat\n\n')) {
+        cleanup();
+      }
     }, 15000);
+
+    // Gracefully end SSE before Vercel's 60s maxDuration so EventSource reconnects cleanly
+    const serverlessMaxLifetime = config.isServerless
+      ? setTimeout(() => {
+          cleanup();
+          if (!res.writableEnded) res.end();
+        }, 45_000)
+      : null;
 
     const cleanup = () => {
       clearInterval(heartbeat);
+      if (serverlessMaxLifetime) clearTimeout(serverlessMaxLifetime);
       notificationBroker.off('workspace:notification', onNotification);
     };
 
@@ -3028,8 +3424,8 @@ export function createApiRouter(): express.Router {
     const q = String(req.query.q ?? '');
     const action = String(req.query.action ?? '');
     const resourceType = String(req.query.resource_type ?? '');
-    const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || 30)));
+    const page = parsePositiveInt(req.query.page, 1, 10_000);
+    const pageSize = parsePositiveInt(req.query.page_size, 30, 100);
 
     const filtered = queryFilteredAuditLogs({ q, action, resourceType });
     const paged = filtered.slice((page - 1) * pageSize, page * pageSize);
@@ -3085,40 +3481,88 @@ export function createApiRouter(): express.Router {
     const before = db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
     const body = req.body ?? {};
 
-    const tolPct = body.tolerance_pct !== undefined ? new Decimal(String(body.tolerance_pct)) : new Decimal(before.tolerance_pct);
-    const tolAbs = body.tolerance_abs !== undefined ? new Decimal(String(body.tolerance_abs)) : new Decimal(before.tolerance_abs);
+    const tolPct =
+      body.tolerance_pct !== undefined
+        ? parseDecimalSafe(String(body.tolerance_pct))
+        : parseDecimalSafe(before.tolerance_pct);
+    const tolAbs =
+      body.tolerance_abs !== undefined
+        ? parseDecimalSafe(String(body.tolerance_abs))
+        : parseDecimalSafe(before.tolerance_abs);
     const confThresh =
       body.confidence_threshold !== undefined
-        ? new Decimal(String(body.confidence_threshold))
-        : new Decimal(before.confidence_threshold);
+        ? parseDecimalSafe(String(body.confidence_threshold))
+        : parseDecimalSafe(before.confidence_threshold);
 
-    if (tolPct.lt(0) || tolPct.gt(25)) {
+    if (!tolPct || tolPct.lt(0) || tolPct.gt(25)) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'tolerance_pct must be between 0 and 25.');
       return;
     }
-    if (confThresh.lt(0.3) || confThresh.gt(0.99)) {
+    if (!tolAbs || tolAbs.lt(0)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'tolerance_abs must be 0 or greater.');
+      return;
+    }
+    if (!confThresh || confThresh.lt(0.3) || confThresh.gt(0.99)) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'confidence_threshold must be between 0.30 and 0.99.');
       return;
     }
 
-    const now = isoNow();
-    const autoCap =
-      body.auto_approve_max_amount === null || body.auto_approve_max_amount === ''
-        ? null
-        : body.auto_approve_max_amount !== undefined
-          ? new Decimal(String(body.auto_approve_max_amount)).toFixed(4)
-          : before.auto_approve_max_amount;
-
-    const reviewerLimit =
-      body.reviewer_approval_limit === null || body.reviewer_approval_limit === ''
-        ? null
-        : body.reviewer_approval_limit !== undefined
-          ? new Decimal(String(body.reviewer_approval_limit)).toFixed(4)
-          : (before.reviewer_approval_limit ?? null);
-
-    if (reviewerLimit !== null && new Decimal(reviewerLimit).lt(0)) {
-      sendError(req, res, 422, 'VALIDATION_ERROR', 'reviewer_approval_limit must be 0 or greater.');
+    const tolMode = body.tolerance_mode !== undefined ? String(body.tolerance_mode) : before.tolerance_mode;
+    if (!['MIN_OF_PCT_AND_ABS', 'MAX_OF_PCT_AND_ABS', 'PCT_ONLY'].includes(tolMode)) {
+      sendError(
+        req,
+        res,
+        422,
+        'VALIDATION_ERROR',
+        'tolerance_mode must be MIN_OF_PCT_AND_ABS, MAX_OF_PCT_AND_ABS, or PCT_ONLY.'
+      );
       return;
+    }
+
+    const ocrMinChars =
+      body.ocr_min_chars_per_page !== undefined
+        ? Number(body.ocr_min_chars_per_page)
+        : Number(before.ocr_min_chars_per_page);
+    if (!Number.isInteger(ocrMinChars) || ocrMinChars < 0 || ocrMinChars > 5000) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'ocr_min_chars_per_page must be an integer between 0 and 5000.');
+      return;
+    }
+
+    const nextCurrency = String(body.default_currency ?? before.default_currency).trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(nextCurrency)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'default_currency must be a 3-letter ISO currency code.');
+      return;
+    }
+
+    const nextWorkspaceName = String(body.workspace_name ?? before.workspace_name).trim();
+    if (!nextWorkspaceName || nextWorkspaceName.length > 120) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'workspace_name must be 1–120 characters.');
+      return;
+    }
+
+    const now = isoNow();
+    let autoCap: string | null = before.auto_approve_max_amount ?? null;
+    if (body.auto_approve_max_amount === null || body.auto_approve_max_amount === '') {
+      autoCap = null;
+    } else if (body.auto_approve_max_amount !== undefined) {
+      const parsedCap = parseDecimalSafe(String(body.auto_approve_max_amount));
+      if (!parsedCap || parsedCap.lt(0)) {
+        sendError(req, res, 422, 'VALIDATION_ERROR', 'auto_approve_max_amount must be 0 or greater.');
+        return;
+      }
+      autoCap = parsedCap.toFixed(4);
+    }
+
+    let reviewerLimit: string | null = before.reviewer_approval_limit ?? null;
+    if (body.reviewer_approval_limit === null || body.reviewer_approval_limit === '') {
+      reviewerLimit = null;
+    } else if (body.reviewer_approval_limit !== undefined) {
+      const parsedLimit = parseDecimalSafe(String(body.reviewer_approval_limit));
+      if (!parsedLimit || parsedLimit.lt(0)) {
+        sendError(req, res, 422, 'VALIDATION_ERROR', 'reviewer_approval_limit must be 0 or greater.');
+        return;
+      }
+      reviewerLimit = parsedLimit.toFixed(4);
     }
 
     const enforceSod =
@@ -3168,13 +3612,13 @@ export function createApiRouter(): express.Router {
         updated_at = ?
        WHERE id = 1`
     ).run(
-      body.workspace_name ?? before.workspace_name,
-      (body.default_currency ?? before.default_currency).toUpperCase(),
-      Number(body.ocr_min_chars_per_page ?? before.ocr_min_chars_per_page),
+      nextWorkspaceName,
+      nextCurrency,
+      ocrMinChars,
       body.force_ocr !== undefined ? (body.force_ocr ? 1 : 0) : before.force_ocr,
       tolPct.toFixed(2),
       tolAbs.toFixed(4),
-      body.tolerance_mode ?? before.tolerance_mode,
+      tolMode,
       confThresh.toFixed(3),
       autoCap,
       reviewerLimit,
@@ -3247,8 +3691,21 @@ export function createApiRouter(): express.Router {
 
   router.post('/users', requireAuth, requireRoles('ADMIN'), (req, res) => {
     const { email, full_name, role, password } = req.body ?? {};
-    if (!email || !full_name || !['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(role)) {
-      sendError(req, res, 422, 'VALIDATION_ERROR', 'Valid email, full_name, and role (OPERATOR, REVIEWER, AUDITOR, ADMIN) are required.');
+    const emailStr = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const fullNameStr = typeof full_name === 'string' ? full_name.trim() : '';
+    const roleStr = typeof role === 'string' ? role.trim().toUpperCase() : '';
+    if (
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailStr) ||
+      !fullNameStr ||
+      !['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(roleStr)
+    ) {
+      sendError(
+        req,
+        res,
+        422,
+        'VALIDATION_ERROR',
+        'Valid email, full_name, and role (OPERATOR, REVIEWER, AUDITOR, ADMIN) are required.'
+      );
       return;
     }
     const db = getDb();
@@ -3258,10 +3715,21 @@ export function createApiRouter(): express.Router {
       db.prepare(
         `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
-      ).run(id, String(email).trim().toLowerCase(), String(full_name).trim(), hashPassword(String(password || 'InvoiceDesk2026!')), role, now, now);
-    } catch {
-      sendError(req, res, 409, 'DUPLICATE_EMAIL', 'A user with that email already exists.');
-      return;
+      ).run(
+        id,
+        emailStr,
+        fullNameStr,
+        hashPassword(String(password || 'InvoiceDesk2026!')),
+        roleStr,
+        now,
+        now
+      );
+    } catch (err: any) {
+      if (String(err?.message || '').includes('UNIQUE')) {
+        sendError(req, res, 409, 'DUPLICATE_EMAIL', 'A user with that email already exists.');
+        return;
+      }
+      throw err;
     }
     writeAuditLog({
       actorId: req.user!.id,
@@ -3270,9 +3738,9 @@ export function createApiRouter(): express.Router {
       action: 'USER_CREATED',
       resourceType: 'USER',
       resourceId: id,
-      details: { email, role },
+      details: { email: emailStr, role: roleStr },
     });
-    res.status(201).json({ id, email, role });
+    res.status(201).json({ id, email: emailStr, role: roleStr });
   });
 
   router.patch('/users/:userId', requireAuth, requireRoles('ADMIN'), (req, res) => {
@@ -3350,5 +3818,5 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  return router;
+  return rawRouter;
 }

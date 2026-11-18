@@ -501,6 +501,8 @@ export interface DecisionExplanationResult {
   suggested_po_number: string | null;
   generated_by_model: string;
   generated_at: string;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 const decisionExplanationSchema = {
@@ -632,18 +634,18 @@ export async function generateDecisionExplanation(params: {
           })
           .parse(JSON.parse(raw));
 
+        const usage = (response as { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } }).usageMetadata;
         return {
           ...parsed,
-          generated_by_model: model,
+          generated_by_model: (response as { modelVersion?: string }).modelVersion || model,
           generated_at: new Date().toISOString(),
+          input_tokens: Number.isFinite(usage?.promptTokenCount) ? Number(usage?.promptTokenCount) : null,
+          output_tokens: Number.isFinite(usage?.candidatesTokenCount) ? Number(usage?.candidatesTokenCount) : null,
         };
       } catch (err) {
         lastError = err;
         if (!isFallbackEligibleError(err)) {
-          if (params.throwOnError !== false) {
-            throw err instanceof Error ? err : new Error(String(err));
-          }
-          break;
+          throw err instanceof Error ? err : new Error(String(err));
         }
         hitCapacityLimit = true;
         if (attempt < maxAttempts - 1) {
@@ -655,7 +657,7 @@ export async function generateDecisionExplanation(params: {
     if (!hitCapacityLimit) break;
   }
 
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Gemini explanation failed.'));
 }
 
 export type RejectionNoticeTone = 'formal' | 'collaborative' | 'concise';
