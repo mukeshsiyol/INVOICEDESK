@@ -23,7 +23,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { useRunEventStream } from '../hooks/useRunEventStream';
 import {
   apiFetch,
@@ -65,7 +65,7 @@ export function ProcessingWorkspacePage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
-  const { user } = useAuth();
+  const { user, role, canDecide, RoleGate } = useRole();
 
   const selectedRunId = searchParams.get('runId') || '';
   const [activeTab, setActiveTab] = useState<'extracted' | 'reconciliation' | 'history'>('extracted');
@@ -83,8 +83,13 @@ export function ProcessingWorkspacePage() {
   const [activeTemplateField, setActiveTemplateField] = useState<'explanation' | 'subject' | 'body'>('body');
   const [previewOpen, setPreviewOpen] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [explainError, setExplainError] = useState<string | null>(null);
   const [copiedEmail, setCopiedEmail] = useState(false);
   const [reviewDraftExpanded, setReviewDraftExpanded] = useState(false);
+
+  useEffect(() => {
+    setExplainError(null);
+  }, [invoiceId]);
 
   const explanationRef = useRef<HTMLTextAreaElement | null>(null);
   const subjectRef = useRef<HTMLInputElement | null>(null);
@@ -240,6 +245,25 @@ export function ProcessingWorkspacePage() {
     },
   });
 
+  const explainMutation = useMutation({
+    mutationFn: () =>
+      apiFetch<{ explanation: string; ai_decision_explanation: any }>(`/invoices/${invoiceId}/explain`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    onMutate: () => {
+      setExplainError(null);
+    },
+    onSuccess: () => {
+      setExplainError(null);
+      void queryClient.invalidateQueries({ queryKey: ['invoice', invoiceId] });
+      void queryClient.invalidateQueries({ queryKey: ['audit-logs'] });
+    },
+    onError: (err: any) => {
+      setExplainError(err?.message || 'Unable to generate Gemini Flash explanation.');
+    },
+  });
+
   const insertRejectionPlaceholder = (token: string) => {
     if (activeTemplateField === 'explanation') {
       setEditingExplanation(true);
@@ -315,8 +339,23 @@ export function ProcessingWorkspacePage() {
   const poSnap = evidenceSnapshot.poMatch;
   const tolSnap = evidenceSnapshot.tolerance;
 
-  const canDecide = user?.role === 'REVIEWER' || user?.role === 'ADMIN';
   const showReviewActions = invoice.review_status === 'PENDING_REVIEW';
+  const isSelfUploadConflict =
+    (settingsData?.enforce_separation_of_duties ?? 1) === 1 &&
+    Boolean(invoice.uploaded_by && user?.id && invoice.uploaded_by === user.id);
+  const reviewerCap =
+    settingsData?.reviewer_approval_limit !== null &&
+    settingsData?.reviewer_approval_limit !== undefined &&
+    settingsData?.reviewer_approval_limit !== ''
+      ? Number(settingsData.reviewer_approval_limit)
+      : null;
+  const exceedsReviewerCap =
+    user?.role === 'REVIEWER' &&
+    reviewerCap !== null &&
+    !Number.isNaN(reviewerCap) &&
+    Number(invoice.total_amount || 0) > reviewerCap;
+  const canApproveThis = canDecide && !isSelfUploadConflict && !exceedsReviewerCap;
+  const canRejectThis = canDecide && !isSelfUploadConflict;
 
   const getFieldConfBadge = (fieldKey: string) => {
     const conf = rawExtracted?.field_confidence?.[fieldKey];
@@ -408,53 +447,63 @@ export function ProcessingWorkspacePage() {
             </select>
           )}
 
-          {activeRun?.status === 'QUEUED' && !activeRun?.started_at ? (
-            <Button
-              size="sm"
-              variant="primary"
-              loading={startMutation.isPending}
-              onClick={() => startMutation.mutate()}
-            >
-              <Play className="w-3.5 h-3.5" />
-              Start Processing
-            </Button>
-          ) : (
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={isRunActive || retryMutation.isPending}
-              loading={retryMutation.isPending}
-              onClick={() => retryMutation.mutate()}
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Re-run Pipeline
-            </Button>
-          )}
+          <RoleGate capability="operate_pipeline">
+            {activeRun?.status === 'QUEUED' && !activeRun?.started_at ? (
+              <Button
+                size="sm"
+                variant="primary"
+                loading={startMutation.isPending}
+                onClick={() => startMutation.mutate()}
+              >
+                <Play className="w-3.5 h-3.5" />
+                Start Processing
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={isRunActive || retryMutation.isPending}
+                loading={retryMutation.isPending}
+                onClick={() => retryMutation.mutate()}
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Re-run Pipeline
+              </Button>
+            )}
+          </RoleGate>
 
-          {showReviewActions && (
-            <>
-              <Button
-                size="sm"
-                variant="approve"
-                disabled={!canDecide}
-                title={canDecide ? 'Approve with mandatory note' : 'Reviewer or Admin role required'}
-                onClick={() => setReviewModal('APPROVE_OVERRIDE')}
-              >
-                <UserCheck className="w-3.5 h-3.5" />
-                Approve
-              </Button>
-              <Button
-                size="sm"
-                variant="destructive"
-                disabled={!canDecide}
-                title={canDecide ? 'Reject with mandatory note' : 'Reviewer or Admin role required'}
-                onClick={() => setReviewModal('REJECT_OVERRIDE')}
-              >
-                <UserX className="w-3.5 h-3.5" />
-                Reject
-              </Button>
-            </>
-          )}
+          <RoleGate roles={['Admin', 'Manager']} when={showReviewActions}>
+            <Button
+              size="sm"
+              variant="approve"
+              disabled={!canApproveThis}
+              title={
+                isSelfUploadConflict
+                  ? 'Separation of duties: uploader cannot review own invoice'
+                  : exceedsReviewerCap
+                    ? 'Exceeds Reviewer approval cap — Admin approval required'
+                    : 'Approve with mandatory note'
+              }
+              onClick={() => setReviewModal('APPROVE_OVERRIDE')}
+            >
+              <UserCheck className="w-3.5 h-3.5" />
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={!canRejectThis}
+              title={
+                isSelfUploadConflict
+                  ? 'Separation of duties: uploader cannot review own invoice'
+                  : 'Reject with mandatory note'
+              }
+              onClick={() => setReviewModal('REJECT_OVERRIDE')}
+            >
+              <UserX className="w-3.5 h-3.5" />
+              Reject
+            </Button>
+          </RoleGate>
         </div>
       </Card>
 
@@ -514,106 +563,158 @@ export function ProcessingWorkspacePage() {
                     </p>
                   </div>
                 </div>
-                <Button size="sm" variant="secondary" onClick={() => retryMutation.mutate()}>
-                  Retry Run
-                </Button>
+                <RoleGate capability="operate_pipeline">
+                  <Button size="sm" variant="secondary" onClick={() => retryMutation.mutate()}>
+                    Retry Run
+                  </Button>
+                </RoleGate>
               </div>
             </Card>
-          ) : decision ? (
-            <Card
-              className={`p-4 ${
-                decision.outcome === 'APPROVE'
-                  ? 'border-emerald-200 dark:border-emerald-900/70 bg-emerald-50/50 dark:bg-emerald-950/20'
-                  : decision.outcome === 'REJECT'
-                    ? 'border-rose-200 dark:border-rose-900/70 bg-rose-50/50 dark:bg-rose-950/20'
-                    : 'border-amber-200 dark:border-amber-900/70 bg-amber-50/50 dark:bg-amber-950/20'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div className="flex items-center gap-2">
-                  <DecisionBadge outcome={decision.outcome} />
-                  <span className="font-mono text-xs font-semibold text-slate-800 dark:text-slate-200">
-                    {decision.primary_reason_code}
-                  </span>
-                </div>
-                <span className="text-[11px] font-mono text-slate-500">
-                  {decision.triggered_rules?.map((r: any) => r.rule_id).join(', ')}
-                </span>
-              </div>
-              <p className="text-sm text-slate-800 dark:text-slate-200 mt-2 leading-relaxed">
-                {decision.explanation_details?.executive_summary || decision.explanation}
-              </p>
+          ) : decision ? (() => {
+            const aiDecisionExplanation = decision.evidence_snapshot?.ai_decision_explanation || null;
+            const aiBrief = decision.evidence_snapshot?.ai_reviewer_brief || null;
+            const deterministicSummary = decision.evidence_snapshot?.deterministic_rule_summary || null;
+            const verificationChecks: string[] =
+              aiDecisionExplanation?.verification_checks?.length
+                ? aiDecisionExplanation.verification_checks
+                : aiBrief?.verification_checks || [];
+            const suggestedPo =
+              aiDecisionExplanation?.suggested_po_number ?? aiBrief?.suggested_po_number ?? null;
 
-              {decision.evidence_snapshot?.ai_reviewer_brief && (
-                <div className="mt-3 p-3 rounded-md bg-white/80 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-700/80 space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
-                      <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                      AI Reviewer Brief
+            return (
+              <Card
+                className={`p-4 ${
+                  decision.outcome === 'APPROVE'
+                    ? 'border-emerald-200 dark:border-emerald-900/70 bg-emerald-50/50 dark:bg-emerald-950/20'
+                    : decision.outcome === 'REJECT'
+                      ? 'border-rose-200 dark:border-rose-900/70 bg-rose-50/50 dark:bg-rose-950/20'
+                      : 'border-amber-200 dark:border-amber-900/70 bg-amber-50/50 dark:bg-amber-950/20'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <DecisionBadge outcome={decision.outcome} />
+                    <span className="font-mono text-xs font-semibold text-slate-800 dark:text-slate-200">
+                      {decision.primary_reason_code}
                     </span>
-                    {decision.evidence_snapshot.ai_reviewer_brief.suggested_po_number && (
-                      <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
-                        Suggested PO: {decision.evidence_snapshot.ai_reviewer_brief.suggested_po_number}
+                    {aiDecisionExplanation ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-800/70 bg-blue-50/90 dark:bg-blue-950/50 text-[11px] font-mono text-blue-700 dark:text-blue-300">
+                        <Sparkles className="w-3 h-3" />
+                        Gemini Flash · {aiDecisionExplanation.generated_by_model}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60 text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                        Rule Engine
                       </span>
                     )}
                   </div>
-                  <p className="text-slate-700 dark:text-slate-300 leading-relaxed">
-                    {decision.evidence_snapshot.ai_reviewer_brief.summary}
-                  </p>
-                  <div className="text-slate-800 dark:text-slate-200">
-                    <span className="font-medium">Next step:</span>{' '}
-                    {decision.evidence_snapshot.ai_reviewer_brief.recommended_action}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[11px] font-mono text-slate-500">
+                      {decision.triggered_rules?.map((r: any) => r.rule_id).join(', ')}
+                    </span>
+                    <RoleGate
+                      roles={['Admin', 'Manager']}
+                      when={invoice.processing_status === 'COMPLETED' && !isRunActive}
+                    >
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        loading={explainMutation.isPending}
+                        onClick={() => explainMutation.mutate()}
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                        {aiDecisionExplanation ? 'Refresh Gemini Flash' : 'Explain with Gemini Flash'}
+                      </Button>
+                    </RoleGate>
                   </div>
-                  {decision.evidence_snapshot.ai_reviewer_brief.verification_checks?.length > 0 && (
-                    <ul className="list-disc pl-4 text-slate-600 dark:text-slate-400 space-y-0.5 pt-0.5">
-                      {decision.evidence_snapshot.ai_reviewer_brief.verification_checks.map((chk: string, idx: number) => (
-                        <li key={idx}>{chk}</li>
-                      ))}
-                    </ul>
-                  )}
                 </div>
-              )}
 
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 dark:border-slate-700/80 pt-2 text-[11px]">
-                <span className={`inline-flex items-center rounded-full border px-2 py-1 font-medium ${
-                  decision.explanation_source === 'GEMINI'
-                    ? 'border-violet-200 bg-violet-50 text-violet-800 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-200'
-                    : 'border-slate-200 bg-slate-100 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
-                }`}>
-                  {decision.explanation_source === 'GEMINI'
-                    ? 'AI-generated explanation · Based on system validation results'
-                    : 'Deterministic fallback explanation'}
-                </span>
-                <span className="text-slate-500 dark:text-slate-400">
-                  {decision.explanation_model || decision.explanation_provider || 'deterministic'}
-                  {' · '}{decision.explanation_status || 'FALLBACK'}
-                </span>
-              </div>
-
-              {decision.explanation_details?.decision_explanation &&
-                decision.explanation_details.decision_explanation !== decision.explanation_details.executive_summary && (
-                  <p className="text-xs text-slate-600 dark:text-slate-300 mt-2 leading-relaxed">
-                    {decision.explanation_details.decision_explanation}
-                  </p>
+                {explainError && (
+                  <div className="mt-3 p-2.5 rounded-md border border-rose-200 dark:border-rose-800/70 bg-rose-50 dark:bg-rose-950/50 text-xs text-rose-700 dark:text-rose-300">
+                    {explainError}
+                  </div>
                 )}
 
-              {decision.explanation_details?.financial_impact && (
-                <p className="text-xs text-slate-600 dark:text-slate-300 mt-2">
-                  <strong>Financial impact:</strong> {decision.explanation_details.financial_impact}
+                <p className="text-sm text-slate-800 dark:text-slate-200 mt-2.5 leading-relaxed">
+                  {decision.explanation}
                 </p>
-              )}
 
-              {decision.explanation_details?.recommended_actions?.length > 0 && (
-                <div className="mt-2 text-xs text-slate-600 dark:text-slate-300">
-                  <strong>Recommended next step:</strong> {decision.explanation_details.recommended_actions.join(' ')}
-                </div>
-              )}
-
-              {decision.explanation_source === 'DETERMINISTIC_FALLBACK' && decision.explanation_fallback_reason && (
-                <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-300">
-                  Gemini explanation unavailable: {decision.explanation_fallback_reason}
-                </p>
-              )}
+                {aiDecisionExplanation ? (
+                  <div className="mt-3 p-3 rounded-md bg-white/80 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-700/80 space-y-2 text-xs">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
+                        <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                        Gemini Flash Analysis
+                      </span>
+                      {suggestedPo && (
+                        <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                          Suggested PO: {suggestedPo}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-slate-800 dark:text-slate-200">
+                      <span className="font-medium">Recommended action:</span>{' '}
+                      {aiDecisionExplanation.recommended_action}
+                    </div>
+                    {aiDecisionExplanation.key_findings?.length > 0 && (
+                      <ul className="list-disc pl-4 text-slate-700 dark:text-slate-300 space-y-0.5">
+                        {aiDecisionExplanation.key_findings.map((finding: string, idx: number) => (
+                          <li key={idx}>{finding}</li>
+                        ))}
+                      </ul>
+                    )}
+                    {verificationChecks.length > 0 && (
+                      <div className="pt-1 border-t border-slate-200/70 dark:border-slate-800">
+                        <div className="font-medium text-slate-700 dark:text-slate-300 mb-0.5">
+                          Verification checklist
+                        </div>
+                        <ul className="list-disc pl-4 text-slate-600 dark:text-slate-400 space-y-0.5">
+                          {verificationChecks.map((chk: string, idx: number) => (
+                            <li key={idx}>{chk}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {deterministicSummary && deterministicSummary !== decision.explanation && (
+                      <div className="pt-1.5 border-t border-slate-200/70 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400">
+                        <span className="font-mono font-semibold uppercase tracking-wide mr-1.5">
+                          Rule Basis:
+                        </span>
+                        {deterministicSummary}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  aiBrief && (
+                    <div className="mt-3 p-3 rounded-md bg-white/80 dark:bg-slate-900/70 border border-slate-200/80 dark:border-slate-700/80 space-y-1.5 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
+                          <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                          AI Reviewer Brief
+                        </span>
+                        {aiBrief.suggested_po_number && (
+                          <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                            Suggested PO: {aiBrief.suggested_po_number}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-slate-700 dark:text-slate-300 leading-relaxed">
+                        {aiBrief.summary}
+                      </p>
+                      <div className="text-slate-800 dark:text-slate-200">
+                        <span className="font-medium">Next step:</span>{' '}
+                        {aiBrief.recommended_action}
+                      </div>
+                      {aiBrief.verification_checks?.length > 0 && (
+                        <ul className="list-disc pl-4 text-slate-600 dark:text-slate-400 space-y-0.5 pt-0.5">
+                          {aiBrief.verification_checks.map((chk: string, idx: number) => (
+                            <li key={idx}>{chk}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )
+                )}
 
               {/* Preserved Original Decision + Human Override */}
               {invoice.review_status !== 'NOT_REQUIRED' && invoice.review_status !== 'PENDING_REVIEW' && (
@@ -638,8 +739,20 @@ export function ProcessingWorkspacePage() {
                   <strong>ADMIN</strong> in the top-right menu to approve or reject this exception.
                 </div>
               )}
+              {showReviewActions && canDecide && isSelfUploadConflict && (
+                <div className="mt-3 pt-2 border-t border-amber-200/60 dark:border-amber-800/40 text-xs text-amber-800 dark:text-amber-300">
+                  <strong>Separation of Duties:</strong> You uploaded this invoice, so another <strong>REVIEWER</strong> or{' '}
+                  <strong>ADMIN</strong> must resolve this exception.
+                </div>
+              )}
+              {showReviewActions && canDecide && !isSelfUploadConflict && exceedsReviewerCap && reviewerCap !== null && (
+                <div className="mt-3 pt-2 border-t border-blue-200/60 dark:border-blue-800/40 text-xs text-blue-800 dark:text-blue-300">
+                  <strong>Approval Cap Exceeded:</strong> Total exceeds the Reviewer override cap ({formatCurrency(reviewerCap, invoice.currency || 'USD')}). An <strong>ADMIN</strong> must approve this override.
+                </div>
+              )}
             </Card>
-          ) : (
+            );
+          })() : (
             <Card className="p-4 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
                 <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
@@ -711,19 +824,24 @@ export function ProcessingWorkspacePage() {
                       </div>
                     </div>
 
-                    {decision.outcome === 'REVIEW' &&
-                      invoice.review_status === 'PENDING_REVIEW' &&
-                      !persistedRejectionNotice &&
-                      !reviewDraftExpanded && (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() => setReviewDraftExpanded(true)}
-                        >
-                          <Sparkles className="w-3.5 h-3.5" />
-                          Draft Rejection Notice
-                        </Button>
-                      )}
+                    <RoleGate
+                      roles={['Admin', 'Manager']}
+                      when={
+                        decision.outcome === 'REVIEW' &&
+                        invoice.review_status === 'PENDING_REVIEW' &&
+                        !persistedRejectionNotice &&
+                        !reviewDraftExpanded
+                      }
+                    >
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => setReviewDraftExpanded(true)}
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        Draft Rejection Notice
+                      </Button>
+                    </RoleGate>
                   </div>
 
                   {(decision.outcome === 'REJECT' ||
@@ -735,50 +853,60 @@ export function ProcessingWorkspacePage() {
                       {draftError && <ErrorBanner message={draftError} />}
 
                       {/* Controls Bar */}
-                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-                        <div className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 p-0.5 shrink-0">
-                          {(['formal', 'collaborative', 'concise'] as const).map((t) => (
-                            <button
-                              key={t}
-                              type="button"
-                              onClick={() => setRejectionTone(t)}
-                              className={`px-2.5 py-1 text-xs font-medium rounded capitalize cursor-pointer transition-colors ${
-                                rejectionTone === t
-                                  ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                                  : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-                              }`}
-                            >
-                              {t}
-                            </button>
-                          ))}
+                      <RoleGate
+                        roles={['Admin', 'Manager']}
+                        fallback={
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            Signed in as <span className="font-mono">{role}</span>. AI draft generation requires an{' '}
+                            <strong>Admin</strong> or <strong>Manager (Reviewer)</strong> role.
+                          </div>
+                        }
+                      >
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                          <div className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 p-0.5 shrink-0">
+                            {(['formal', 'collaborative', 'concise'] as const).map((t) => (
+                              <button
+                                key={t}
+                                type="button"
+                                onClick={() => setRejectionTone(t)}
+                                className={`px-2.5 py-1 text-xs font-medium rounded capitalize cursor-pointer transition-colors ${
+                                  rejectionTone === t
+                                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                                    : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                                }`}
+                              >
+                                {t}
+                              </button>
+                            ))}
+                          </div>
+
+                          <input
+                            type="text"
+                            value={customDraftPrompt}
+                            onChange={(e) => setCustomDraftPrompt(e.target.value)}
+                            placeholder="Optional AI instruction (e.g. ask vendor to reference PO-2025-1001)…"
+                            maxLength={300}
+                            className="flex-1 h-8 px-2.5 text-xs rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+
+                          <Button
+                            size="sm"
+                            variant="primary"
+                            loading={rejectionDraftMutation.isPending}
+                            onClick={() =>
+                              rejectionDraftMutation.mutate({
+                                tone: rejectionTone,
+                                custom_instructions: customDraftPrompt.trim() || undefined,
+                                subject_template: draftSubject.trim() || undefined,
+                                body_template: draftBody.trim() || undefined,
+                              })
+                            }
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            {persistedRejectionNotice ? 'Regenerate with AI' : 'Explain & Draft Email'}
+                          </Button>
                         </div>
-
-                        <input
-                          type="text"
-                          value={customDraftPrompt}
-                          onChange={(e) => setCustomDraftPrompt(e.target.value)}
-                          placeholder="Optional AI instruction (e.g. ask vendor to reference PO-2025-1001)…"
-                          maxLength={300}
-                          className="flex-1 h-8 px-2.5 text-xs rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        />
-
-                        <Button
-                          size="sm"
-                          variant="primary"
-                          loading={rejectionDraftMutation.isPending}
-                          onClick={() =>
-                            rejectionDraftMutation.mutate({
-                              tone: rejectionTone,
-                              custom_instructions: customDraftPrompt.trim() || undefined,
-                              subject_template: draftSubject.trim() || undefined,
-                              body_template: draftBody.trim() || undefined,
-                            })
-                          }
-                        >
-                          <Sparkles className="w-3.5 h-3.5" />
-                          {persistedRejectionNotice ? 'Regenerate with AI' : 'Explain & Draft Email'}
-                        </Button>
-                      </div>
+                      </RoleGate>
 
                       {/* Plain-English Rejection Breakdown (supports placeholders inside [Reason for Rejection]) */}
                       <div className="p-3 rounded-md bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800 space-y-2 text-xs">

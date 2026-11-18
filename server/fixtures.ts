@@ -464,6 +464,18 @@ export async function seedInitialDatabase(): Promise<void> {
   const db = getDb();
   const userCount = (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
   if (userCount > 0) {
+    if (config.appEnv === 'demo' || config.pauseAuthForDemo) {
+      const hasAuditor = db
+        .prepare("SELECT 1 FROM users WHERE role = 'AUDITOR' LIMIT 1")
+        .get();
+      if (!hasAuditor) {
+        const now = isoNow();
+        db.prepare(
+          `INSERT OR IGNORE INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'AUDITOR', 'light', 1, ?, ?)`
+        ).run('usr-aud-004', 'auditor@invoicedesk.io', 'Marcus Vance', hashPassword('InvoiceDesk2026!'), now, now);
+      }
+    }
     await ensureDemoFixturesGenerated();
     return;
   }
@@ -472,6 +484,7 @@ export async function seedInitialDatabase(): Promise<void> {
   const adminId = 'usr-admin-001';
   const reviewerId = 'usr-rev-002';
   const operatorId = 'usr-ops-003';
+  const auditorId = 'usr-aud-004';
   const defaultPass = hashPassword('InvoiceDesk2026!');
 
   db.prepare(
@@ -490,8 +503,13 @@ export async function seedInitialDatabase(): Promise<void> {
   ).run(operatorId, 'operator@invoicedesk.io', 'Maya Lin', defaultPass, 'OPERATOR', now, now);
 
   db.prepare(
-    `INSERT INTO application_settings (id, workspace_name, default_currency, max_upload_mb, ocr_min_chars_per_page, force_ocr, tolerance_pct, tolerance_abs, tolerance_mode, confidence_threshold, auto_approve_max_amount, rejection_email_subject_template, rejection_email_body_template, updated_by, updated_at)
-     VALUES (1, 'InvoiceDesk', 'USD', 25, 50, 0, '2.00', '10.0000', 'MIN_OF_PCT_AND_ABS', '0.850', '25000.0000', ?, ?, ?, ?)`
+    `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
+  ).run(auditorId, 'auditor@invoicedesk.io', 'Marcus Vance', defaultPass, 'AUDITOR', now, now);
+
+  db.prepare(
+    `INSERT INTO application_settings (id, workspace_name, default_currency, max_upload_mb, ocr_min_chars_per_page, force_ocr, tolerance_pct, tolerance_abs, tolerance_mode, confidence_threshold, auto_approve_max_amount, reviewer_approval_limit, enforce_separation_of_duties, rejection_email_subject_template, rejection_email_body_template, updated_by, updated_at)
+     VALUES (1, 'InvoiceDesk', 'USD', 25, 50, 0, '2.00', '10.0000', 'MIN_OF_PCT_AND_ABS', '0.850', '25000.0000', '10000.0000', 1, ?, ?, ?, ?)`
   ).run(DEFAULT_REJECTION_SUBJECT_TEMPLATE, DEFAULT_REJECTION_BODY_TEMPLATE, adminId, now);
 
   // Vendors V-001 .. V-005

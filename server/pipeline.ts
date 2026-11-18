@@ -4,7 +4,6 @@ import Decimal from 'decimal.js';
 import { writeAuditLog } from './auth.ts';
 import { config } from './config.ts';
 import { getDb, isoNow } from './db.ts';
-import { fallbackDecisionExplanation, generateDecisionExplanation, type ExplanationInput } from './explanation.ts';
 import {
   normalizeDocNumber,
   parseDecimalSafe,
@@ -18,7 +17,7 @@ import {
 } from './engine.ts';
 import {
   defaultExtractionProvider,
-  generateReviewerBrief,
+  generateDecisionExplanation,
   inspectPdfNativeText,
   readStoredPdf,
   validatePdfBuffer,
@@ -507,39 +506,52 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       settings,
     });
 
-    const aiReviewerBrief =
-      decisionResult.outcome === 'APPROVE'
-        ? null
-        : await generateReviewerBrief({
-            outcome: decisionResult.outcome,
-            primaryReasonCode: decisionResult.primaryReasonCode,
-            explanation: decisionResult.explanation,
-            triggeredRules: decisionResult.triggeredRules,
-            extracted,
-            candidatePos: poMatch.candidatePos || [],
-          });
+    let aiDecisionExplanation: Awaited<ReturnType<typeof generateDecisionExplanation>> | null = null;
+    let aiExplanationError: string | null = null;
+    try {
+      aiDecisionExplanation = await generateDecisionExplanation({
+        outcome: decisionResult.outcome,
+        primaryReasonCode: decisionResult.primaryReasonCode,
+        deterministicSummary: decisionResult.explanation,
+        triggeredRules: decisionResult.triggeredRules,
+        invoice: {
+          vendor_name: vendorResult.canonicalName || extracted.vendor.name,
+          invoice_number: extracted.invoice_number,
+          invoice_date: extracted.invoice_date,
+          po_number: poMatch.matchedPoNumber || extracted.po_number,
+          currency: extracted.currency,
+          subtotal_amount: extracted.subtotal,
+          tax_amount: extracted.tax_amount,
+          total_amount: extracted.total_amount,
+        },
+        evidenceSummary: {
+          vendor_match: vendorResult.matchMethod,
+          vendor_status: vendorResult.vendorStatus,
+          duplicate_match: dupResult.matchType,
+          po_match_status: poMatch.matchStatus,
+          po_remaining_before: tolerance.remainingBefore,
+          po_remaining_after: tolerance.remainingAfter,
+          overrun_amount: tolerance.overrunAmount,
+          allowed_cap: tolerance.allowedCap,
+        },
+        candidatePos: poMatch.candidatePos || [],
+        throwOnError: false,
+      });
+    } catch (err) {
+      aiExplanationError = err instanceof Error ? err.message : String(err);
+      console.warn('[Pipeline Stage 8] Gemini Flash explanation skipped:', aiExplanationError);
+    }
 
-    const explanationInput: ExplanationInput = {
-      outcome: decisionResult.outcome,
-      primaryReasonCode: decisionResult.primaryReasonCode,
-      triggeredRules: decisionResult.triggeredRules,
-      evidenceSnapshot: {
-        ...decisionResult.evidenceSnapshot,
-        ...(aiReviewerBrief ? { ai_reviewer_brief: aiReviewerBrief } : {}),
-      } as unknown as Record<string, unknown>,
-      invoice: {
-        filename: invoiceRow.original_filename,
-        vendor: extracted.vendor.name,
-        invoiceNumber: extracted.invoice_number,
-        currency: extracted.currency,
-        subtotal: extracted.subtotal,
-        tax: extracted.tax_amount,
-        total: extracted.total_amount,
-        purchaseOrder: extracted.po_number,
-      },
-    };
-    // Gemini explains the fixed result; only the deterministic engine sets the outcome.
-    let explanation = await generateDecisionExplanation(explanationInput);
+    const aiReviewerBrief =
+      decisionResult.outcome !== 'APPROVE' && aiDecisionExplanation
+        ? {
+            summary: aiDecisionExplanation.explanation,
+            recommended_action: aiDecisionExplanation.recommended_action,
+            verification_checks: aiDecisionExplanation.verification_checks,
+            suggested_po_number: aiDecisionExplanation.suggested_po_number,
+            generated_by_model: aiDecisionExplanation.generated_by_model,
+          }
+        : null;
 
     const decisionId = crypto.randomUUID();
     const completedAt = isoNow();
@@ -551,7 +563,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       // Re-verify PO balance under exclusive write lock if auto-approving
       let finalOutcome = decisionResult.outcome;
       let finalReasonCode = decisionResult.primaryReasonCode;
-      let finalExplanation = explanation.decision_explanation;
+      let finalExplanation = aiDecisionExplanation?.explanation || decisionResult.explanation;
       let finalReviewStatus = reviewStatus;
       let finalTriggered = decisionResult.triggeredRules;
 
@@ -599,25 +611,6 @@ export async function executeProcessingRun(runId: string): Promise<void> {
               evidence: { rem_before: remBefore.toFixed(2), overrun: overrun.toFixed(2) },
             },
           ];
-          explanation = fallbackDecisionExplanation(
-            {
-              ...explanationInput,
-              outcome: finalOutcome,
-              primaryReasonCode: finalReasonCode,
-              triggeredRules: finalTriggered,
-              evidenceSnapshot: {
-                ...explanationInput.evidenceSnapshot,
-                tolerance: {
-                  ...tolerance,
-                  remainingBefore: remBefore.toFixed(2),
-                  overrunAmount: overrun.toFixed(2),
-                  withinTolerance: false,
-                },
-              },
-            },
-            'Concurrent PO balance changed during processing; explanation was generated deterministically from the final locked result.'
-          );
-          explanation.decision_explanation = finalExplanation;
         } else {
           const newConsumed = consumed.plus(totalDec);
           const newStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
@@ -630,16 +623,18 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
       const fullEvidenceSnapshot = {
         ...decisionResult.evidenceSnapshot,
+        deterministic_rule_summary: decisionResult.explanation,
+        ...(aiDecisionExplanation
+          ? { ai_decision_explanation: aiDecisionExplanation }
+          : aiExplanationError
+            ? { ai_explanation_error: aiExplanationError }
+            : {}),
         ...(aiReviewerBrief ? { ai_reviewer_brief: aiReviewerBrief } : {}),
       };
 
       db.prepare(
-        `INSERT INTO decisions (
-          id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
-          explanation_source, explanation_provider, explanation_model, explanation_prompt_version, explanation_status,
-          explanation_generated_at, explanation_input_tokens, explanation_output_tokens, explanation_fallback_reason,
-          explanation_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO decisions (id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         decisionId,
         runId,
@@ -649,16 +644,6 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         JSON.stringify(finalTriggered),
         finalExplanation,
         JSON.stringify(fullEvidenceSnapshot),
-        explanation.explanation_source,
-        explanation.explanation_provider,
-        explanation.explanation_model,
-        explanation.prompt_version,
-        explanation.generation_status,
-        explanation.generated_at,
-        explanation.token_usage.input,
-        explanation.token_usage.output,
-        explanation.fallback_reason,
-        JSON.stringify(explanation),
         completedAt
       );
 
@@ -696,9 +681,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
           run_number: runRow.run_number,
           primary_reason_code: finalReasonCode,
           explanation: finalExplanation,
-          explanation_source: explanation.explanation_source,
-          explanation_model: explanation.explanation_model,
-          explanation_status: explanation.generation_status,
+          explanation_model: aiDecisionExplanation?.generated_by_model ?? null,
         },
       });
 
@@ -733,17 +716,11 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         stageNumber: 8,
         status: 'COMPLETED',
         durationMs: Date.now() - s8Start,
-        summary: `Final Decision: ${finalOutcome} (${finalReasonCode}) · Explanation ${explanation.explanation_source}`,
+        summary: `Final Decision: ${finalOutcome} (${finalReasonCode})`,
         evidence: {
           outcome: finalOutcome,
           primary_reason_code: finalReasonCode,
           triggered_rules: finalTriggered,
-          explanation_source: explanation.explanation_source,
-          explanation_provider: explanation.explanation_provider,
-          explanation_model: explanation.explanation_model,
-          explanation_status: explanation.generation_status,
-          explanation_fallback_reason: explanation.fallback_reason,
-          token_usage: explanation.token_usage,
         },
       });
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { apiFetch, DEMO_ROLE_STORAGE_KEY } from '../lib/api';
+import { apiFetch, getDemoAuthQueryString } from '../lib/api';
 
 export type NotificationEventType =
   | 'INVOICE_UPLOADED'
@@ -81,12 +81,7 @@ export function useWorkspaceNotifications(userId: string | undefined, userRole?:
   useEffect(() => {
     if (!userId) return;
 
-    const storedRole =
-      typeof window !== 'undefined' ? window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY) : null;
-    const roleQuery =
-      storedRole === 'OPERATOR' || storedRole === 'REVIEWER' || storedRole === 'ADMIN'
-        ? `?demo_role=${storedRole}`
-        : '';
+    const roleQuery = getDemoAuthQueryString();
 
     const es = new EventSource(`/api/v1/notifications/stream${roleQuery}`, {
       withCredentials: true,

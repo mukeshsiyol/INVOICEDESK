@@ -1,4 +1,4 @@
-export type UserRole = 'OPERATOR' | 'REVIEWER' | 'ADMIN';
+export type UserRole = 'OPERATOR' | 'REVIEWER' | 'AUDITOR' | 'ADMIN';
 
 export interface UserProfile {
   id: string;
@@ -25,18 +25,60 @@ export class ApiError extends Error {
 }
 
 export const DEMO_ROLE_STORAGE_KEY = 'invoicedesk_demo_role';
+export const DEMO_USER_ID_STORAGE_KEY = 'invoicedesk_demo_user_id';
+
+export interface SwitchableUser {
+  id: string;
+  email: string;
+  full_name: string;
+  role: UserRole;
+}
+
+export function getDemoAuthHeaders(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  const headers: Record<string, string> = {};
+  const storedUserId = window.localStorage.getItem(DEMO_USER_ID_STORAGE_KEY);
+  if (storedUserId && storedUserId.trim()) {
+    headers['X-Demo-User-Id'] = storedUserId.trim();
+  }
+  const storedDemoRole = window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY);
+  if (
+    storedDemoRole === 'OPERATOR' ||
+    storedDemoRole === 'REVIEWER' ||
+    storedDemoRole === 'AUDITOR' ||
+    storedDemoRole === 'ADMIN'
+  ) {
+    headers['X-Demo-Role'] = storedDemoRole;
+  }
+  return headers;
+}
+
+export function getDemoAuthQueryString(): string {
+  if (typeof window === 'undefined') return '';
+  const params = new URLSearchParams();
+  const storedUserId = window.localStorage.getItem(DEMO_USER_ID_STORAGE_KEY);
+  if (storedUserId && storedUserId.trim()) {
+    params.set('demo_user_id', storedUserId.trim());
+  }
+  const storedDemoRole = window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY);
+  if (
+    storedDemoRole === 'OPERATOR' ||
+    storedDemoRole === 'REVIEWER' ||
+    storedDemoRole === 'AUDITOR' ||
+    storedDemoRole === 'ADMIN'
+  ) {
+    params.set('demo_role', storedDemoRole);
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
+}
 
 export async function apiFetch<T = any>(path: string, init?: RequestInit): Promise<T> {
   const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData;
-  const headers: Record<string, string> = isFormData
-    ? {}
-    : { 'Content-Type': 'application/json' };
-
-  const storedDemoRole =
-    typeof window !== 'undefined' ? window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY) : null;
-  if (storedDemoRole === 'OPERATOR' || storedDemoRole === 'REVIEWER' || storedDemoRole === 'ADMIN') {
-    headers['X-Demo-Role'] = storedDemoRole;
-  }
+  const headers: Record<string, string> = {
+    ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+    ...getDemoAuthHeaders(),
+  };
 
   const res = await fetch(`/api/v1${path}`, {
     credentials: 'include',
@@ -67,12 +109,7 @@ export async function apiFetch<T = any>(path: string, init?: RequestInit): Promi
 }
 
 export async function downloadCsv(path: string, fallbackFilename: string): Promise<void> {
-  const headers: Record<string, string> = {};
-  const storedDemoRole =
-    typeof window !== 'undefined' ? window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY) : null;
-  if (storedDemoRole === 'OPERATOR' || storedDemoRole === 'REVIEWER' || storedDemoRole === 'ADMIN') {
-    headers['X-Demo-Role'] = storedDemoRole;
-  }
+  const headers = getDemoAuthHeaders();
 
   const res = await fetch(`/api/v1${path}`, {
     credentials: 'include',

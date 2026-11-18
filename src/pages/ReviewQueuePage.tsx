@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, ClipboardCheck, ExternalLink, UserCheck, UserX } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, formatCurrency, formatDateTime } from '../lib/api';
 import {
   Button,
@@ -18,6 +19,7 @@ export function ReviewQueuePage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  const { canDecide, RoleGate } = useRole();
 
   const [tab, setTab] = useState<'PENDING_REVIEW' | 'RESOLVED'>('PENDING_REVIEW');
   const [category, setCategory] = useState('ALL');
@@ -28,6 +30,11 @@ export function ReviewQueuePage() {
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['reviews', tab, category],
     queryFn: () => apiFetch<{ items: any[]; total: number }>(`/reviews?status=${tab}&category=${category}`),
+  });
+
+  const { data: settingsData } = useQuery({
+    queryKey: ['settings'],
+    queryFn: () => apiFetch<any>('/settings'),
   });
 
   const decideMutation = useMutation({
@@ -49,8 +56,6 @@ export function ReviewQueuePage() {
       setActionError(err?.message || 'Unable to save review decision.');
     },
   });
-
-  const canDecide = user?.role === 'REVIEWER' || user?.role === 'ADMIN';
 
   return (
     <div className="space-y-5">
@@ -233,62 +238,95 @@ export function ReviewQueuePage() {
               </div>
             )}
 
-            {tab === 'PENDING_REVIEW' && (
-              <div className="space-y-3 pt-2 border-t border-slate-200 dark:border-slate-800">
-                {actionError && <ErrorBanner message={actionError} />}
-                {!canDecide && (
-                  <div className="text-xs text-amber-700 dark:text-amber-300">
-                    Active role <strong>{user?.role}</strong> is read-only. Switch to{' '}
-                    <strong>REVIEWER</strong> or <strong>ADMIN</strong> to submit a decision.
-                  </div>
-                )}
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                    Mandatory Reviewer Note (min 10 chars)
-                  </label>
-                  <textarea
-                    rows={3}
-                    value={note}
-                    onChange={(e) => setNote(e.target.value)}
-                    disabled={!canDecide}
-                    placeholder="Document your verification reasoning for the audit trail..."
-                    className="w-full p-2.5 text-sm rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <Button
-                    variant="approve"
-                    disabled={!canDecide || note.trim().length < 10}
-                    loading={decideMutation.isPending}
-                    onClick={() =>
-                      decideMutation.mutate({
-                        invoiceId: selected.id,
-                        action: 'APPROVE_OVERRIDE',
-                        reviewNote: note.trim(),
-                      })
+            {tab === 'PENDING_REVIEW' && (() => {
+              const isSelfUploadConflict =
+                (settingsData?.enforce_separation_of_duties ?? 1) === 1 &&
+                Boolean(selected.uploaded_by && user?.id && selected.uploaded_by === user.id);
+              const reviewerCap =
+                settingsData?.reviewer_approval_limit !== null &&
+                settingsData?.reviewer_approval_limit !== undefined &&
+                settingsData?.reviewer_approval_limit !== ''
+                  ? Number(settingsData.reviewer_approval_limit)
+                  : null;
+              const exceedsReviewerCap =
+                user?.role === 'REVIEWER' &&
+                reviewerCap !== null &&
+                !Number.isNaN(reviewerCap) &&
+                Number(selected.total_amount || 0) > reviewerCap;
+              const canApproveThis = canDecide && !isSelfUploadConflict && !exceedsReviewerCap;
+              const canRejectThis = canDecide && !isSelfUploadConflict;
+
+              return (
+                <div className="space-y-3 pt-2 border-t border-slate-200 dark:border-slate-800">
+                  {actionError && <ErrorBanner message={actionError} />}
+                  {canDecide && isSelfUploadConflict && (
+                    <div className="p-2.5 rounded-md border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-800 dark:text-amber-200">
+                      <strong>Separation of Duties:</strong> You uploaded this invoice, so another Reviewer or Administrator must resolve it.
+                    </div>
+                  )}
+                  {canDecide && !isSelfUploadConflict && exceedsReviewerCap && reviewerCap !== null && (
+                    <div className="p-2.5 rounded-md border border-blue-200 dark:border-blue-800/70 bg-blue-50 dark:bg-blue-950/40 text-xs text-blue-800 dark:text-blue-200">
+                      <strong>Approval Cap Exceeded:</strong> Invoice total exceeds the Reviewer approval limit ({formatCurrency(reviewerCap, selected.currency)}). An <strong>ADMIN</strong> must approve this override.
+                    </div>
+                  )}
+                  <RoleGate
+                    roles={['Admin', 'Manager']}
+                    fallback={
+                      <div className="text-xs text-amber-700 dark:text-amber-300">
+                        Active role <strong>{user?.role}</strong> is read-only. Switch to{' '}
+                        <strong>REVIEWER</strong> (Manager) or <strong>ADMIN</strong> to submit an approval or rejection decision.
+                      </div>
                     }
                   >
-                    <UserCheck className="w-4 h-4" />
-                    Approve Override
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    disabled={!canDecide || note.trim().length < 10}
-                    loading={decideMutation.isPending}
-                    onClick={() =>
-                      decideMutation.mutate({
-                        invoiceId: selected.id,
-                        action: 'REJECT_OVERRIDE',
-                        reviewNote: note.trim(),
-                      })
-                    }
-                  >
-                    <UserX className="w-4 h-4" />
-                    Reject Override
-                  </Button>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                        Mandatory Reviewer Note (min 10 chars)
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={note}
+                        onChange={(e) => setNote(e.target.value)}
+                        disabled={!canRejectThis}
+                        placeholder="Document your verification reasoning for the audit trail..."
+                        className="w-full p-2.5 text-sm rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        variant="approve"
+                        disabled={!canApproveThis || note.trim().length < 10}
+                        loading={decideMutation.isPending}
+                        onClick={() =>
+                          decideMutation.mutate({
+                            invoiceId: selected.id,
+                            action: 'APPROVE_OVERRIDE',
+                            reviewNote: note.trim(),
+                          })
+                        }
+                      >
+                        <UserCheck className="w-4 h-4" />
+                        Approve Override
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        disabled={!canRejectThis || note.trim().length < 10}
+                        loading={decideMutation.isPending}
+                        onClick={() =>
+                          decideMutation.mutate({
+                            invoiceId: selected.id,
+                            action: 'REJECT_OVERRIDE',
+                            reviewNote: note.trim(),
+                          })
+                        }
+                      >
+                        <UserX className="w-4 h-4" />
+                        Reject Override
+                      </Button>
+                    </div>
+                  </RoleGate>
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </Card>
         )}
       </div>

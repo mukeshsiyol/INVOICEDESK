@@ -90,8 +90,8 @@ export function LoginPage() {
               <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
               <span>Quick Demo Persona Access</span>
             </div>
-            <div className="grid grid-cols-3 gap-2">
-              {(['OPERATOR', 'REVIEWER', 'ADMIN'] as UserRole[]).map((role) => (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {(['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'] as UserRole[]).map((role) => (
                 <Button
                   key={role}
                   type="button"

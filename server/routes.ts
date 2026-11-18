@@ -23,6 +23,7 @@ import { normalizeDocNumber, normalizeVendorName } from './engine.ts';
 import {
   GeminiConfigurationError,
   extractQuickInvoiceSignals,
+  generateDecisionExplanation,
   generateRejectionNoticeDraft,
   persistValidatedPdf,
   readStoredPdf,
@@ -447,24 +448,61 @@ export function createApiRouter(): express.Router {
     res.json({ ...req.user!, demo_mode: config.enableDemoRoleSwitcher, auth_paused: config.pauseAuthForDemo });
   });
 
-  router.post('/auth/demo-switch', (req, res) => {
-    if (!config.enableDemoRoleSwitcher) {
-      sendError(req, res, 404, 'NOT_FOUND', 'Demo role switcher is disabled.');
-      return;
-    }
-    const role = String(req.body?.role ?? '').toUpperCase() as UserRole;
-    if (!['OPERATOR', 'REVIEWER', 'ADMIN'].includes(role)) {
-      sendError(req, res, 422, 'VALIDATION_ERROR', 'Role must be OPERATOR, REVIEWER, or ADMIN.');
+  router.get('/auth/users', requireAuth, (req, res) => {
+    if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo) {
+      sendError(req, res, 404, 'NOT_FOUND', 'User switcher is disabled.');
       return;
     }
     const db = getDb();
-    const target = db
-      .prepare('SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE role = ? AND is_active = 1 LIMIT 1')
-      .get(role) as AuthUser | undefined;
-    if (!target) {
-      sendError(req, res, 404, 'NOT_FOUND', `No active user with role ${role}.`);
+    const users = db
+      .prepare(
+        `SELECT id, email, full_name, role
+         FROM users
+         WHERE is_active = 1
+         ORDER BY CASE role
+           WHEN 'ADMIN' THEN 1
+           WHEN 'REVIEWER' THEN 2
+           WHEN 'OPERATOR' THEN 3
+           WHEN 'AUDITOR' THEN 4
+           ELSE 5
+         END, created_at ASC`
+      )
+      .all();
+    res.json({ items: users });
+  });
+
+  router.post('/auth/demo-switch', (req, res) => {
+    if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Demo role switcher is disabled.');
       return;
     }
+    const db = getDb();
+    const userId = req.body?.user_id ? String(req.body.user_id).trim() : '';
+    let target: AuthUser | undefined;
+
+    if (userId) {
+      target = db
+        .prepare('SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE id = ? AND is_active = 1 LIMIT 1')
+        .get(userId) as AuthUser | undefined;
+      if (!target) {
+        sendError(req, res, 404, 'NOT_FOUND', 'Selected active user not found.');
+        return;
+      }
+    } else {
+      const role = String(req.body?.role ?? '').toUpperCase() as UserRole;
+      if (!['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(role)) {
+        sendError(req, res, 422, 'VALIDATION_ERROR', 'Role must be OPERATOR, REVIEWER, AUDITOR, or ADMIN.');
+        return;
+      }
+      target = db
+        .prepare('SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE role = ? AND is_active = 1 ORDER BY created_at ASC LIMIT 1')
+        .get(role) as AuthUser | undefined;
+      if (!target) {
+        sendError(req, res, 404, 'NOT_FOUND', `No active user with role ${role}.`);
+        return;
+      }
+    }
+
     const prev = getUserFromRequest(req);
     setSessionCookie(res, signSessionToken(target), req);
     writeAuditLog({
@@ -474,7 +512,7 @@ export function createApiRouter(): express.Router {
       action: 'AUTH_DEMO_SWITCH',
       resourceType: 'USER',
       resourceId: target.id,
-      details: { previous_role: prev?.role ?? null, new_role: target.role },
+      details: { previous_user_id: prev?.id ?? null, previous_role: prev?.role ?? null, new_user_id: target.id, new_role: target.role },
     });
     res.json({ ...target, demo_mode: true, auth_paused: config.pauseAuthForDemo });
   });
@@ -499,7 +537,7 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== UPLOAD & PRECHECK ====================
-  router.post('/invoices/precheck-hash', requireAuth, (req, res) => {
+  router.post('/invoices/precheck-hash', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), (req, res) => {
     const hashes = Array.isArray(req.body?.hashes) ? req.body.hashes : [];
     const db = getDb();
     const matches = hashes.map((h: { client_id?: string; sha256?: string }) => {
@@ -529,6 +567,7 @@ export function createApiRouter(): express.Router {
   router.post(
     '/invoices/precheck-duplicates',
     requireAuth,
+    requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'),
     (req, res, next) => {
       upload.array('files', config.maxBatchFiles)(req, res, (err: any) => {
         if (err) {
@@ -894,6 +933,7 @@ export function createApiRouter(): express.Router {
   router.post(
     '/invoices/upload',
     requireAuth,
+    requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'),
     (req, res, next) => {
       upload.array('files', config.maxBatchFiles)(req, res, (err: any) => {
         if (err) {
@@ -949,7 +989,7 @@ export function createApiRouter(): express.Router {
     }
   );
 
-  router.post('/invoices/upload-fixture', requireAuth, async (req, res) => {
+  router.post('/invoices/upload-fixture', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const key = String(req.body?.fixture_key ?? '');
     const meta = DEMO_FIXTURES.find((f) => f.key === key);
     if (!meta) {
@@ -1213,7 +1253,7 @@ export function createApiRouter(): express.Router {
     res.json({ extraction_mode: run?.extraction_mode ?? 'NATIVE_TEXT', pages });
   });
 
-  router.post('/invoices/:invoiceId/start', requireAuth, async (req, res) => {
+  router.post('/invoices/:invoiceId/start', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
     const inv = db
       .prepare('SELECT id, latest_run_id, processing_status FROM invoices WHERE id = ?')
@@ -1265,7 +1305,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/invoices/:invoiceId/retry', requireAuth, async (req, res) => {
+  router.post('/invoices/:invoiceId/retry', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
     const inv = db
       .prepare('SELECT id, processing_status FROM invoices WHERE id = ?')
@@ -1598,7 +1638,7 @@ export function createApiRouter(): express.Router {
     try {
       const inv = db
         .prepare(
-          `SELECT id, invoice_number, original_filename, purchase_order_id, total_amount, po_consumed_applied, business_decision, review_status, latest_decision_id
+          `SELECT id, uploaded_by, invoice_number, original_filename, purchase_order_id, total_amount, po_consumed_applied, business_decision, review_status, latest_decision_id
            FROM invoices WHERE id = ?`
         )
         .get(req.params.invoiceId) as any;
@@ -1619,6 +1659,50 @@ export function createApiRouter(): express.Router {
           `This invoice was already resolved (${inv.review_status}).`
         );
         return;
+      }
+
+      const policySettings = db
+        .prepare('SELECT enforce_separation_of_duties, reviewer_approval_limit FROM application_settings WHERE id = 1')
+        .get() as
+        | { enforce_separation_of_duties?: number; reviewer_approval_limit?: string | null }
+        | undefined;
+
+      if ((policySettings?.enforce_separation_of_duties ?? 1) === 1 && inv.uploaded_by === req.user!.id) {
+        db.exec('ROLLBACK;');
+        sendError(
+          req,
+          res,
+          403,
+          'SEPARATION_OF_DUTIES_VIOLATION',
+          'Separation of duties prevents you from reviewing an invoice you uploaded. Another Reviewer or Administrator must resolve this exception.',
+          { uploaded_by: inv.uploaded_by, actor_id: req.user!.id }
+        );
+        return;
+      }
+
+      if (
+        action === 'APPROVE_OVERRIDE' &&
+        req.user!.role === 'REVIEWER' &&
+        policySettings?.reviewer_approval_limit &&
+        inv.total_amount
+      ) {
+        const limitDec = new Decimal(policySettings.reviewer_approval_limit);
+        const totalDec = new Decimal(inv.total_amount);
+        if (totalDec.gt(limitDec)) {
+          db.exec('ROLLBACK;');
+          sendError(
+            req,
+            res,
+            403,
+            'APPROVAL_LIMIT_EXCEEDED',
+            `Invoice total ($${totalDec.toFixed(2)}) exceeds the Reviewer override cap ($${limitDec.toFixed(2)}). An Administrator must approve this override.`,
+            {
+              invoice_total: totalDec.toFixed(2),
+              reviewer_approval_limit: limitDec.toFixed(2),
+            }
+          );
+          return;
+        }
       }
 
       const newReviewStatus = action === 'APPROVE_OVERRIDE' ? 'APPROVED_BY_HUMAN' : 'REJECTED_BY_HUMAN';
@@ -1691,7 +1775,183 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.post('/invoices/:invoiceId/rejection-draft', requireAuth, async (req, res) => {
+  // ==================== GEMINI FLASH DECISION EXPLANATION ====================
+  router.post('/invoices/:invoiceId/explain', requireAuth, requireRoles('REVIEWER', 'ADMIN'), async (req, res) => {
+    const db = getDb();
+    const inv = db
+      .prepare(
+        `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.verification_status AS vendor_verification_status,
+                po.po_number AS matched_po_number
+         FROM invoices i
+         LEFT JOIN vendors v ON v.id = i.vendor_id
+         LEFT JOIN purchase_orders po ON po.id = i.purchase_order_id
+         WHERE i.id = ?`
+      )
+      .get(req.params.invoiceId) as any;
+
+    if (!inv) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
+      return;
+    }
+
+    if (inv.processing_status !== 'COMPLETED' || !inv.latest_decision_id) {
+      sendError(
+        req,
+        res,
+        409,
+        'INVALID_STATE',
+        'Gemini Flash decision explanations are available after the processing pipeline completes.'
+      );
+      return;
+    }
+
+    const decisionRow = db
+      .prepare('SELECT * FROM decisions WHERE id = ?')
+      .get(inv.latest_decision_id) as any;
+
+    if (!decisionRow) {
+      sendError(req, res, 404, 'NOT_FOUND', 'Decision record not found for this invoice.');
+      return;
+    }
+
+    const triggeredRules = JSON.parse(decisionRow.triggered_rules || '[]');
+    const evidenceSnapshot = JSON.parse(decisionRow.evidence_snapshot || '{}');
+    const deterministicSummary =
+      typeof evidenceSnapshot.deterministic_rule_summary === 'string' &&
+      evidenceSnapshot.deterministic_rule_summary.trim()
+        ? evidenceSnapshot.deterministic_rule_summary
+        : decisionRow.explanation;
+
+    let candidatePos: Array<{ po_number: string; remaining_amount: string; currency?: string }> =
+      Array.isArray(evidenceSnapshot.poMatch?.candidatePos)
+        ? evidenceSnapshot.poMatch.candidatePos
+        : [];
+
+    if (candidatePos.length === 0 && inv.vendor_id) {
+      const openPos = db
+        .prepare(
+          `SELECT po_number, original_amount, consumed_amount, currency
+           FROM purchase_orders
+           WHERE vendor_id = ? AND status IN ('OPEN', 'PARTIALLY_CONSUMED')
+           ORDER BY created_at DESC LIMIT 5`
+        )
+        .all(inv.vendor_id) as Array<{
+        po_number: string;
+        original_amount: string;
+        consumed_amount: string;
+        currency: string;
+      }>;
+      candidatePos = openPos.map((po) => {
+        const rem = Decimal.max(
+          new Decimal(0),
+          new Decimal(po.original_amount).minus(new Decimal(po.consumed_amount))
+        );
+        return {
+          po_number: po.po_number,
+          remaining_amount: rem.toFixed(2),
+          currency: po.currency,
+        };
+      });
+    }
+
+    try {
+      const result = await generateDecisionExplanation({
+        outcome: decisionRow.outcome,
+        primaryReasonCode: decisionRow.primary_reason_code,
+        deterministicSummary,
+        triggeredRules,
+        invoice: {
+          vendor_name: inv.vendor_canonical_name || inv.extracted_vendor_name || null,
+          invoice_number: inv.invoice_number || null,
+          invoice_date: inv.invoice_date || null,
+          po_number: inv.matched_po_number || inv.extracted_po_number || null,
+          currency: inv.currency || null,
+          subtotal_amount: inv.subtotal_amount || null,
+          tax_amount: inv.tax_amount || null,
+          total_amount: inv.total_amount || null,
+        },
+        evidenceSummary: {
+          vendor_match: evidenceSnapshot.vendor?.matchMethod ?? null,
+          vendor_status: inv.vendor_verification_status ?? evidenceSnapshot.vendor?.vendorStatus ?? null,
+          duplicate_match: evidenceSnapshot.duplicate?.matchType ?? null,
+          po_match_status: evidenceSnapshot.poMatch?.matchStatus ?? null,
+          po_remaining_before: evidenceSnapshot.tolerance?.remainingBefore ?? null,
+          po_remaining_after: evidenceSnapshot.tolerance?.remainingAfter ?? null,
+          overrun_amount: evidenceSnapshot.tolerance?.overrunAmount ?? null,
+          allowed_cap: evidenceSnapshot.tolerance?.allowedCap ?? null,
+        },
+        candidatePos,
+        throwOnError: true,
+      });
+
+      const aiReviewerBrief =
+        decisionRow.outcome !== 'APPROVE'
+          ? {
+              summary: result.explanation,
+              recommended_action: result.recommended_action,
+              verification_checks: result.verification_checks,
+              suggested_po_number: result.suggested_po_number,
+              generated_by_model: result.generated_by_model,
+            }
+          : null;
+
+      const updatedSnapshot: Record<string, unknown> = {
+        ...evidenceSnapshot,
+        deterministic_rule_summary: deterministicSummary,
+        ai_decision_explanation: result,
+      };
+      delete updatedSnapshot.ai_explanation_error;
+      if (aiReviewerBrief) {
+        updatedSnapshot.ai_reviewer_brief = aiReviewerBrief;
+      }
+
+      db.prepare('UPDATE decisions SET explanation = ?, evidence_snapshot = ? WHERE id = ?').run(
+        result.explanation,
+        JSON.stringify(updatedSnapshot),
+        decisionRow.id
+      );
+
+      writeAuditLog({
+        actorId: req.user!.id,
+        actorType: 'USER',
+        actorRole: req.user!.role,
+        action: 'AI_DECISION_EXPLAINED',
+        resourceType: 'INVOICE',
+        resourceId: inv.id,
+        originalDecision: decisionRow.outcome,
+        newDecision: decisionRow.outcome,
+        details: {
+          decision_id: decisionRow.id,
+          primary_reason_code: decisionRow.primary_reason_code,
+          explanation: result.explanation,
+          model: result.generated_by_model,
+        },
+      });
+
+      res.json({
+        explanation: result.explanation,
+        ai_decision_explanation: result,
+        ai_reviewer_brief: aiReviewerBrief,
+      });
+    } catch (err) {
+      if (err instanceof GeminiConfigurationError) {
+        sendError(req, res, 503, 'GEMINI_NOT_CONFIGURED', err.message);
+        return;
+      }
+      const message = err instanceof Error ? err.message : 'Unable to generate Gemini Flash explanation.';
+      const status =
+        /\b403\b|PERMISSION_DENIED/i.test(message)
+          ? 403
+          : /\b429\b|RESOURCE_EXHAUSTED/i.test(message)
+            ? 429
+            : /\b400\b|API_KEY_INVALID/i.test(message)
+              ? 400
+              : 502;
+      sendError(req, res, status, 'GEMINI_GENERATION_FAILED', message);
+    }
+  });
+
+  router.post('/invoices/:invoiceId/rejection-draft', requireAuth, requireRoles('REVIEWER', 'ADMIN'), async (req, res) => {
     const rawTone = String(req.body?.tone ?? 'formal').toLowerCase();
     const tone: RejectionNoticeTone =
       rawTone === 'collaborative' || rawTone === 'concise' ? rawTone : 'formal';
@@ -2764,7 +3024,7 @@ export function createApiRouter(): express.Router {
       });
   }
 
-  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), (req, res) => {
     const q = String(req.query.q ?? '');
     const action = String(req.query.action ?? '');
     const resourceType = String(req.query.resource_type ?? '');
@@ -2776,7 +3036,7 @@ export function createApiRouter(): express.Router {
     res.json({ items: paged, total: filtered.length, page, page_size: pageSize });
   });
 
-  router.get('/audit-logs/export', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+  router.get('/audit-logs/export', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), (req, res) => {
     const q = String(req.query.q ?? '');
     const action = String(req.query.action ?? '');
     const resourceType = String(req.query.resource_type ?? '');
@@ -2815,7 +3075,7 @@ export function createApiRouter(): express.Router {
     const settings = db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
     res.json({
       ...settings,
-      active_extraction_provider: `Gemini (${config.geminiModel})`,
+      active_extraction_provider: `Gemini Flash (${config.geminiModel})`,
       gemini_configured: Boolean(config.geminiApiKey && config.geminiApiKey !== 'MY_GEMINI_API_KEY'),
     });
   });
@@ -2849,6 +3109,25 @@ export function createApiRouter(): express.Router {
           ? new Decimal(String(body.auto_approve_max_amount)).toFixed(4)
           : before.auto_approve_max_amount;
 
+    const reviewerLimit =
+      body.reviewer_approval_limit === null || body.reviewer_approval_limit === ''
+        ? null
+        : body.reviewer_approval_limit !== undefined
+          ? new Decimal(String(body.reviewer_approval_limit)).toFixed(4)
+          : (before.reviewer_approval_limit ?? null);
+
+    if (reviewerLimit !== null && new Decimal(reviewerLimit).lt(0)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'reviewer_approval_limit must be 0 or greater.');
+      return;
+    }
+
+    const enforceSod =
+      body.enforce_separation_of_duties !== undefined
+        ? body.enforce_separation_of_duties
+          ? 1
+          : 0
+        : (before.enforce_separation_of_duties ?? 1);
+
     const nextSubjectTemplate =
       body.rejection_email_subject_template !== undefined
         ? String(body.rejection_email_subject_template).trim()
@@ -2878,6 +3157,8 @@ export function createApiRouter(): express.Router {
         tolerance_mode = ?,
         confidence_threshold = ?,
         auto_approve_max_amount = ?,
+        reviewer_approval_limit = ?,
+        enforce_separation_of_duties = ?,
         notify_on_upload = ?,
         notify_on_review = ?,
         notify_on_failure = ?,
@@ -2896,6 +3177,8 @@ export function createApiRouter(): express.Router {
       body.tolerance_mode ?? before.tolerance_mode,
       confThresh.toFixed(3),
       autoCap,
+      reviewerLimit,
+      enforceSod,
       body.notify_on_upload !== undefined ? (body.notify_on_upload ? 1 : 0) : (before.notify_on_upload ?? 1),
       body.notify_on_review !== undefined ? (body.notify_on_review ? 1 : 0) : before.notify_on_review,
       body.notify_on_failure !== undefined ? (body.notify_on_failure ? 1 : 0) : before.notify_on_failure,
@@ -2918,6 +3201,8 @@ export function createApiRouter(): express.Router {
           tolerance_abs: before.tolerance_abs,
           confidence_threshold: before.confidence_threshold,
           force_ocr: before.force_ocr,
+          reviewer_approval_limit: before.reviewer_approval_limit ?? null,
+          enforce_separation_of_duties: Boolean(before.enforce_separation_of_duties ?? 1),
           rejection_email_template_changed:
             nextSubjectTemplate !== before.rejection_email_subject_template ||
             nextBodyTemplate !== before.rejection_email_body_template,
@@ -2927,6 +3212,8 @@ export function createApiRouter(): express.Router {
           tolerance_abs: tolAbs.toFixed(4),
           confidence_threshold: confThresh.toFixed(3),
           force_ocr: body.force_ocr ?? Boolean(before.force_ocr),
+          reviewer_approval_limit: reviewerLimit,
+          enforce_separation_of_duties: Boolean(enforceSod),
           rejection_email_subject_template: nextSubjectTemplate,
         },
       },
@@ -2960,8 +3247,8 @@ export function createApiRouter(): express.Router {
 
   router.post('/users', requireAuth, requireRoles('ADMIN'), (req, res) => {
     const { email, full_name, role, password } = req.body ?? {};
-    if (!email || !full_name || !['OPERATOR', 'REVIEWER', 'ADMIN'].includes(role)) {
-      sendError(req, res, 422, 'VALIDATION_ERROR', 'Valid email, full_name, and role are required.');
+    if (!email || !full_name || !['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(role)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'Valid email, full_name, and role (OPERATOR, REVIEWER, AUDITOR, ADMIN) are required.');
       return;
     }
     const db = getDb();
@@ -2990,13 +3277,45 @@ export function createApiRouter(): express.Router {
 
   router.patch('/users/:userId', requireAuth, requireRoles('ADMIN'), (req, res) => {
     const db = getDb();
-    const existing = db.prepare('SELECT id, role, is_active FROM users WHERE id = ?').get(req.params.userId) as any;
+    const existing = db.prepare('SELECT id, email, role, is_active FROM users WHERE id = ?').get(req.params.userId) as any;
     if (!existing) {
       sendError(req, res, 404, 'NOT_FOUND', 'User not found.');
       return;
     }
-    const nextRole = req.body?.role ?? existing.role;
+    const nextRole = req.body?.role !== undefined ? String(req.body.role).toUpperCase() : existing.role;
+    if (!['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(nextRole)) {
+      sendError(req, res, 422, 'VALIDATION_ERROR', 'Role must be OPERATOR, REVIEWER, AUDITOR, or ADMIN.');
+      return;
+    }
     const nextActive = req.body?.is_active !== undefined ? (req.body.is_active ? 1 : 0) : existing.is_active;
+
+    if (existing.id === req.user!.id && (nextRole !== 'ADMIN' || !nextActive)) {
+      sendError(
+        req,
+        res,
+        409,
+        'SELF_LOCKOUT_PREVENTED',
+        'Administrators cannot demote or deactivate their own active account.'
+      );
+      return;
+    }
+
+    if (existing.role === 'ADMIN' && existing.is_active === 1 && (nextRole !== 'ADMIN' || !nextActive)) {
+      const remainingAdmins = db
+        .prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'ADMIN' AND is_active = 1 AND id != ?")
+        .get(existing.id) as { cnt: number };
+      if ((remainingAdmins?.cnt ?? 0) === 0) {
+        sendError(
+          req,
+          res,
+          409,
+          'LAST_ADMIN_REQUIRED',
+          'At least one active Administrator must remain in the workspace.'
+        );
+        return;
+      }
+    }
+
     db.prepare('UPDATE users SET role = ?, is_active = ?, updated_at = ? WHERE id = ?').run(
       nextRole,
       nextActive,
@@ -3010,7 +3329,11 @@ export function createApiRouter(): express.Router {
       action: 'USER_UPDATED',
       resourceType: 'USER',
       resourceId: existing.id,
-      details: { role: nextRole, is_active: Boolean(nextActive) },
+      details: {
+        email: existing.email,
+        before: { role: existing.role, is_active: Boolean(existing.is_active) },
+        after: { role: nextRole, is_active: Boolean(nextActive) },
+      },
     });
     res.json({ ok: true });
   });

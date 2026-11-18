@@ -23,6 +23,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, formatCurrency, formatDateTime } from '../lib/api';
 import {
   Button,
@@ -40,6 +41,7 @@ const DECISION_COLORS: Record<string, string> = {
 };
 
 export function OverviewPage() {
+  const { RoleGate } = useRole();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [windowRange, setWindowRange] = useState<'7d' | '30d' | '90d' | 'all'>('30d');
@@ -107,10 +109,12 @@ export function OverviewPage() {
               </button>
             ))}
           </div>
-          <Button variant="primary" onClick={() => navigate('/upload')}>
-            <Plus className="w-4 h-4" />
-            Upload Invoice
-          </Button>
+          <RoleGate capability="operate_pipeline">
+            <Button variant="primary" onClick={() => navigate('/upload')}>
+              <Plus className="w-4 h-4" />
+              Upload Invoice
+            </Button>
+          </RoleGate>
         </div>
       </div>
 
@@ -359,7 +363,15 @@ export function OverviewPage() {
                     <span className="font-mono tabular-nums text-xs font-medium text-slate-700 dark:text-slate-300">
                       {formatCurrency(item.total_amount, item.currency)}
                     </span>
-                    {item.processing_status === 'FAILED' ? (
+                    <RoleGate
+                      capability="operate_pipeline"
+                      when={item.processing_status === 'FAILED'}
+                      fallback={
+                        <Button size="sm" variant="secondary" onClick={() => navigate(`/invoices/${item.id}`)}>
+                          Inspect
+                        </Button>
+                      }
+                    >
                       <Button
                         size="sm"
                         variant="secondary"
@@ -369,11 +381,7 @@ export function OverviewPage() {
                         <RefreshCw className="w-3.5 h-3.5" />
                         Retry
                       </Button>
-                    ) : (
-                      <Button size="sm" variant="secondary" onClick={() => navigate(`/invoices/${item.id}`)}>
-                        Inspect
-                      </Button>
-                    )}
+                    </RoleGate>
                   </div>
                 </div>
               ))

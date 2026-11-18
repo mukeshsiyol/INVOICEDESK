@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { DEMO_ROLE_STORAGE_KEY } from '../lib/api';
+import { getDemoAuthQueryString } from '../lib/api';
 
 export interface LiveStageEvent {
   id: number;
@@ -33,12 +33,7 @@ export function useRunEventStream(params: {
     let closedByTerminal = false;
     setStreamStatus('connecting');
 
-    const storedRole =
-      typeof window !== 'undefined' ? window.localStorage.getItem(DEMO_ROLE_STORAGE_KEY) : null;
-    const roleQuery =
-      storedRole === 'OPERATOR' || storedRole === 'REVIEWER' || storedRole === 'ADMIN'
-        ? `?demo_role=${storedRole}`
-        : '';
+    const roleQuery = getDemoAuthQueryString();
 
     const es = new EventSource(`/api/v1/runs/${params.runId}/events${roleQuery}`, {
       withCredentials: true,

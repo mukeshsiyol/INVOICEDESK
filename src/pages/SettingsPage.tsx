@@ -20,6 +20,7 @@ import {
   Users,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { useTheme, type ThemeMode } from '../context/ThemeContext';
 import { apiFetch, formatDateTime, type UserRole } from '../lib/api';
 import {
@@ -43,9 +44,9 @@ type SettingsTab =
 
 export function SettingsPage() {
   const { user, refreshUser } = useAuth();
+  const { isAdmin, RoleGate } = useRole();
   const { theme, setTheme } = useTheme();
   const queryClient = useQueryClient();
-  const isAdmin = user?.role === 'ADMIN';
 
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
@@ -65,6 +66,8 @@ export function SettingsPage() {
     tolerance_mode: 'MIN',
     confidence_threshold: '0.80',
     auto_approve_max_amount: '25000.00',
+    reviewer_approval_limit: '10000.00',
+    enforce_separation_of_duties: true,
     notify_on_upload: true,
     notify_on_review: true,
     notify_on_failure: true,
@@ -106,6 +109,11 @@ export function SettingsPage() {
           settingsData.auto_approve_max_amount != null
             ? String(Number(settingsData.auto_approve_max_amount).toFixed(2))
             : '',
+        reviewer_approval_limit:
+          settingsData.reviewer_approval_limit != null
+            ? String(Number(settingsData.reviewer_approval_limit).toFixed(2))
+            : '',
+        enforce_separation_of_duties: settingsData.enforce_separation_of_duties !== 0,
         notify_on_upload: settingsData.notify_on_upload !== 0,
         notify_on_review: Boolean(settingsData.notify_on_review),
         notify_on_failure: Boolean(settingsData.notify_on_failure),
@@ -155,6 +163,7 @@ export function SettingsPage() {
         body: JSON.stringify({
           ...form,
           auto_approve_max_amount: form.auto_approve_max_amount.trim() === '' ? null : form.auto_approve_max_amount,
+          reviewer_approval_limit: form.reviewer_approval_limit.trim() === '' ? null : form.reviewer_approval_limit,
         }),
       }),
     onSuccess: () => {
@@ -209,6 +218,7 @@ export function SettingsPage() {
       setNewUser({ email: '', full_name: '', role: 'OPERATOR', password: 'InvoiceDesk2026!' });
       setSavedMsg('New user account created.');
       void queryClient.invalidateQueries({ queryKey: ['admin-users'] });
+      void queryClient.invalidateQueries({ queryKey: ['switchable-users'] });
     },
     onError: (err: any) => {
       setErrorMsg(err?.message || 'Failed to create user.');
@@ -222,7 +232,14 @@ export function SettingsPage() {
         body: JSON.stringify({ role, is_active }),
       }),
     onSuccess: () => {
+      setErrorMsg(null);
+      setSavedMsg('User permissions updated.');
       void queryClient.invalidateQueries({ queryKey: ['admin-users'] });
+      void queryClient.invalidateQueries({ queryKey: ['switchable-users'] });
+    },
+    onError: (err: any) => {
+      setSavedMsg(null);
+      setErrorMsg(err?.message || 'Unable to update user.');
     },
   });
 
@@ -522,6 +539,42 @@ export function SettingsPage() {
                           className={`${inputClass} font-mono tabular-nums`}
                         />
                       </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+                          Reviewer Override Limit ($)
+                        </label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min={0}
+                          disabled={!isAdmin}
+                          value={form.reviewer_approval_limit}
+                          onChange={(e) => setForm({ ...form, reviewer_approval_limit: e.target.value })}
+                          placeholder="Leave blank for no cap"
+                          className={`${inputClass} font-mono tabular-nums`}
+                        />
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          Invoices above this amount require an ADMIN to confirm human approval.
+                        </p>
+                      </div>
+                      <div className="flex items-start gap-3 pt-6">
+                        <input
+                          id="enforce-sod"
+                          type="checkbox"
+                          disabled={!isAdmin}
+                          checked={form.enforce_separation_of_duties}
+                          onChange={(e) =>
+                            setForm({ ...form, enforce_separation_of_duties: e.target.checked })
+                          }
+                          className="mt-1 h-4 w-4 rounded border-slate-300 text-blue-600"
+                        />
+                        <label htmlFor="enforce-sod" className="text-sm text-slate-700 dark:text-slate-200">
+                          <span className="font-medium block">Enforce Separation of Duties</span>
+                          <span className="text-xs text-slate-500">
+                            Prevent users from approving or rejecting invoices they uploaded themselves.
+                          </span>
+                        </label>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -579,7 +632,7 @@ export function SettingsPage() {
                           <Eye className="w-3.5 h-3.5" />
                           Preview
                         </Button>
-                        {isAdmin && (
+                        <RoleGate roles={['ADMIN']}>
                           <Button
                             type="button"
                             size="sm"
@@ -595,7 +648,7 @@ export function SettingsPage() {
                             <RotateCcw className="w-3.5 h-3.5" />
                             Reset Default
                           </Button>
-                        )}
+                        </RoleGate>
                       </div>
                     </div>
 
@@ -766,20 +819,25 @@ export function SettingsPage() {
                               <td className="py-2.5 px-4">
                                 <select
                                   value={u.role}
+                                  disabled={u.id === user?.id}
+                                  title={u.id === user?.id ? 'You cannot change your own active admin role' : undefined}
                                   onChange={(e) =>
                                     updateUser.mutate({ id: u.id, role: e.target.value as UserRole })
                                   }
-                                  className="h-7 px-2 text-xs font-mono rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                                  className="h-7 px-2 text-xs font-mono rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-60"
                                 >
                                   <option value="OPERATOR">OPERATOR</option>
                                   <option value="REVIEWER">REVIEWER</option>
+                                  <option value="AUDITOR">AUDITOR</option>
                                   <option value="ADMIN">ADMIN</option>
                                 </select>
                               </td>
                               <td className="py-2.5 px-4">
                                 <button
+                                  disabled={u.id === user?.id}
+                                  title={u.id === user?.id ? 'You cannot deactivate your own active account' : undefined}
                                   onClick={() => updateUser.mutate({ id: u.id, is_active: !u.is_active })}
-                                  className={`px-2 py-0.5 rounded text-xs font-medium cursor-pointer ${
+                                  className={`px-2 py-0.5 rounded text-xs font-medium cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed ${
                                     u.is_active
                                       ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
                                       : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
@@ -840,7 +898,7 @@ export function SettingsPage() {
                   </div>
                 )}
 
-                {isAdmin && activeTab !== 'users' && activeTab !== 'appearance' && (
+                <RoleGate roles={['ADMIN']} when={activeTab !== 'users' && activeTab !== 'appearance'}>
                   <div className="pt-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-end">
                     <Button
                       variant="primary"
@@ -851,7 +909,7 @@ export function SettingsPage() {
                       Save Policy Settings
                     </Button>
                   </div>
-                )}
+                </RoleGate>
               </>
             )}
           </Card>
@@ -894,6 +952,7 @@ export function SettingsPage() {
             >
               <option value="OPERATOR">OPERATOR</option>
               <option value="REVIEWER">REVIEWER</option>
+              <option value="AUDITOR">AUDITOR</option>
               <option value="ADMIN">ADMIN</option>
             </select>
           </div>

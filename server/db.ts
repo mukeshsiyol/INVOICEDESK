@@ -25,7 +25,7 @@ function initSchema(db: DatabaseSync): void {
       email TEXT NOT NULL UNIQUE,
       full_name TEXT NOT NULL,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('OPERATOR', 'REVIEWER', 'ADMIN')),
+      role TEXT NOT NULL CHECK (role IN ('OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN')),
       theme_preference TEXT NOT NULL DEFAULT 'light' CHECK (theme_preference IN ('light', 'dark', 'system')),
       is_active INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -223,6 +223,8 @@ function initSchema(db: DatabaseSync): void {
       tolerance_mode TEXT NOT NULL DEFAULT 'MIN_OF_PCT_AND_ABS',
       confidence_threshold TEXT NOT NULL DEFAULT '0.850',
       auto_approve_max_amount TEXT DEFAULT '25000.0000',
+      reviewer_approval_limit TEXT DEFAULT '10000.0000',
+      enforce_separation_of_duties INTEGER NOT NULL DEFAULT 1,
       notify_on_upload INTEGER NOT NULL DEFAULT 1,
       notify_on_review INTEGER NOT NULL DEFAULT 1,
       notify_on_failure INTEGER NOT NULL DEFAULT 1,
@@ -256,6 +258,39 @@ function initSchema(db: DatabaseSync): void {
   `);
 
   // Safe migration for existing SQLite databases
+  const usersTableMeta = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+    .get() as { sql?: string } | undefined;
+  if (usersTableMeta?.sql && !usersTableMeta.sql.includes("'AUDITOR'")) {
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      db.exec(`
+        CREATE TABLE users_new (
+          id TEXT PRIMARY KEY,
+          email TEXT NOT NULL UNIQUE,
+          full_name TEXT NOT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN')),
+          theme_preference TEXT NOT NULL DEFAULT 'light' CHECK (theme_preference IN ('light', 'dark', 'system')),
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO users_new (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
+        SELECT id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+      `);
+      db.exec('COMMIT;');
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;');
+    }
+  }
+
   const cols = db.prepare('PRAGMA table_info(application_settings)').all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === 'notify_on_upload')) {
     db.exec('ALTER TABLE application_settings ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 1;');
@@ -265,6 +300,12 @@ function initSchema(db: DatabaseSync): void {
   }
   if (!cols.some((c) => c.name === 'rejection_email_body_template')) {
     db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_body_template TEXT NOT NULL DEFAULT '';");
+  }
+  if (!cols.some((c) => c.name === 'reviewer_approval_limit')) {
+    db.exec("ALTER TABLE application_settings ADD COLUMN reviewer_approval_limit TEXT DEFAULT '10000.0000';");
+  }
+  if (!cols.some((c) => c.name === 'enforce_separation_of_duties')) {
+    db.exec('ALTER TABLE application_settings ADD COLUMN enforce_separation_of_duties INTEGER NOT NULL DEFAULT 1;');
   }
 
   db.prepare(

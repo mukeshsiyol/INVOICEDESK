@@ -55,7 +55,7 @@ export function buildOpenApiSpec(serverOrigin: string) {
       '/auth/demo-switch': {
         post: {
           tags: ['Auth'],
-          summary: 'Switch active demo persona (OPERATOR | REVIEWER | ADMIN)',
+          summary: 'Switch active demo persona (OPERATOR | REVIEWER | AUDITOR | ADMIN)',
           responses: { '200': { description: 'Updated persona session' } },
         },
       },
@@ -154,10 +154,18 @@ export function buildOpenApiSpec(serverOrigin: string) {
           responses: { '200': { description: 'Review action persisted and PO debited if approved' } },
         },
       },
+      '/invoices/{invoiceId}/explain': {
+        post: {
+          tags: ['Invoices'],
+          summary: 'Generate or refresh a Gemini Flash decision explanation for any completed invoice (REVIEWER/ADMIN)',
+          parameters: [{ name: 'invoiceId', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '200': { description: 'Generated Gemini Flash decision explanation' } },
+        },
+      },
       '/invoices/{invoiceId}/rejection-draft': {
         post: {
           tags: ['Invoices'],
-          summary: 'Generate grounded Gemini AI rejection explanation and editable vendor rejection email draft',
+          summary: 'Generate grounded Gemini AI rejection explanation and editable vendor rejection email draft (REVIEWER/ADMIN)',
           parameters: [{ name: 'invoiceId', in: 'path', required: true, schema: { type: 'string' } }],
           responses: { '200': { description: 'Generated rejection explanation and email draft' } },
         },
@@ -253,14 +261,14 @@ export function buildOpenApiSpec(serverOrigin: string) {
       '/audit-logs': {
         get: {
           tags: ['Audit & Settings'],
-          summary: 'Query immutable audit log trail (REVIEWER/ADMIN)',
+          summary: 'Query immutable audit log trail (REVIEWER/AUDITOR/ADMIN)',
           responses: { '200': { description: 'Audit events' } },
         },
       },
       '/audit-logs/export': {
         get: {
           tags: ['Audit & Settings'],
-          summary: 'Export immutable audit trail as CSV (ADMIN)',
+          summary: 'Export immutable audit trail as CSV (REVIEWER/AUDITOR/ADMIN)',
           responses: { '200': { description: 'CSV download' } },
         },
       },

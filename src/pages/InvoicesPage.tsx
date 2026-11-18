@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, FileText, Play, Plus, RefreshCw, Search } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, downloadCsv, formatCurrency, formatShortDate } from '../lib/api';
 import {
   Button,
@@ -36,6 +37,7 @@ interface InvoiceListItem {
 }
 
 export function InvoicesPage() {
+  const { RoleGate } = useRole();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -160,10 +162,12 @@ export function InvoicesPage() {
                 ? 'Export Filtered CSV'
                 : 'Export CSV'}
           </Button>
-          <Button variant="primary" onClick={() => navigate('/upload')}>
-            <Plus className="w-4 h-4" />
-            Upload Invoice
-          </Button>
+          <RoleGate capability="operate_pipeline">
+            <Button variant="primary" onClick={() => navigate('/upload')}>
+              <Plus className="w-4 h-4" />
+              Upload Invoice
+            </Button>
+          </RoleGate>
         </div>
       </div>
 
@@ -264,9 +268,11 @@ export function InvoicesPage() {
                     Clear All Filters
                   </Button>
                 ) : (
-                  <Button variant="primary" onClick={() => navigate('/upload')}>
-                    Upload Invoice
-                  </Button>
+                  <RoleGate capability="operate_pipeline">
+                    <Button variant="primary" onClick={() => navigate('/upload')}>
+                      Upload Invoice
+                    </Button>
+                  </RoleGate>
                 )
               }
             />
@@ -418,7 +424,10 @@ export function InvoicesPage() {
                             className="flex items-center justify-end gap-1"
                             onClick={(e) => e.stopPropagation()}
                           >
-                            {inv.processing_status === 'QUEUED' && !inv.run_started_at && (
+                            <RoleGate
+                              capability="operate_pipeline"
+                              when={inv.processing_status === 'QUEUED' && !inv.run_started_at}
+                            >
                               <Button
                                 size="sm"
                                 variant="primary"
@@ -427,8 +436,11 @@ export function InvoicesPage() {
                                 <Play className="w-3 h-3" />
                                 Start
                               </Button>
-                            )}
-                            {inv.processing_status === 'FAILED' && (
+                            </RoleGate>
+                            <RoleGate
+                              capability="operate_pipeline"
+                              when={inv.processing_status === 'FAILED'}
+                            >
                               <Button
                                 size="sm"
                                 variant="secondary"
@@ -437,7 +449,7 @@ export function InvoicesPage() {
                                 <RefreshCw className="w-3 h-3" />
                                 Retry
                               </Button>
-                            )}
+                            </RoleGate>
                             <Button
                               size="sm"
                               variant="ghost"

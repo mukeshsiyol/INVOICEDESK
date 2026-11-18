@@ -18,16 +18,22 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(FIXTURES_DIR, { recursive: true });
 
+const pauseAuthForDemo =
+  (process.env.PAUSE_AUTH_FOR_DEMO ?? 'true').toLowerCase() === 'true';
+const explicitRoleSwitcher = process.env.ENABLE_DEMO_ROLE_SWITCHER?.trim().toLowerCase();
+
 export const config = {
   port: Number(process.env.PORT || 3000),
   nodeEnv: process.env.NODE_ENV || 'development',
   isServerless,
   appEnv: process.env.APP_ENV || 'demo',
   enableDemoRoleSwitcher:
-    (process.env.ENABLE_DEMO_ROLE_SWITCHER ?? 'true').toLowerCase() === 'true' &&
-    (process.env.APP_ENV ?? 'demo') === 'demo',
-  pauseAuthForDemo:
-    (process.env.PAUSE_AUTH_FOR_DEMO ?? 'true').toLowerCase() === 'true',
+    explicitRoleSwitcher === 'false'
+      ? false
+      : explicitRoleSwitcher === 'true' ||
+        (process.env.APP_ENV ?? 'demo') === 'demo' ||
+        pauseAuthForDemo,
+  pauseAuthForDemo,
   geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
   geminiModel: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
   geminiFallbackModel: 'gemini-3.1-flash-lite',

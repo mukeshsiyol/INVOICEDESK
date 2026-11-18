@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Building2, Download, Plus, Search, X } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, downloadCsv, formatCurrency, formatShortDate } from '../lib/api';
 import {
   Button,
@@ -18,7 +18,7 @@ import {
 export function VendorsPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { user } = useAuth();
+  const { RoleGate } = useRole();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [q, setQ] = useState('');
@@ -86,9 +86,6 @@ export function VendorsPage() {
     },
   });
 
-  const isAdmin = user?.role === 'ADMIN';
-  const canVerify = user?.role === 'ADMIN' || user?.role === 'REVIEWER';
-
   const statusBadge = (status: string) => {
     if (status === 'APPROVED')
       return <span className="font-mono text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">APPROVED</span>;
@@ -143,12 +140,12 @@ export function VendorsPage() {
             <Download className="w-4 h-4" />
             Export Vendor Report CSV
           </Button>
-          {isAdmin && (
+          <RoleGate roles={['ADMIN']}>
             <Button variant="primary" onClick={() => setCreateOpen(true)}>
               <Plus className="w-4 h-4" />
               Add Vendor
             </Button>
-          )}
+          </RoleGate>
         </div>
       </div>
 
@@ -258,7 +255,7 @@ export function VendorsPage() {
                   <Download className="w-3.5 h-3.5" />
                   Export Report CSV
                 </Button>
-                {canVerify && (
+                <RoleGate roles={['Admin', 'Manager']}>
                   <select
                     value={detailData.vendor.verification_status}
                     onChange={(e) =>
@@ -273,7 +270,7 @@ export function VendorsPage() {
                     <option value="UNVERIFIED">UNVERIFIED</option>
                     <option value="BLOCKED">BLOCKED</option>
                   </select>
-                )}
+                </RoleGate>
               </div>
             </div>
 
@@ -288,8 +285,9 @@ export function VendorsPage() {
                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-100 dark:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
                   >
                     {a}
-                    {isAdmin && (
+                    <RoleGate capability="delete_resource">
                       <button
+                        aria-label={`Delete alias ${a}`}
                         onClick={() =>
                           updateVendorMutation.mutate({
                             vendorId: detailData.vendor.id,
@@ -302,11 +300,11 @@ export function VendorsPage() {
                       >
                         <X className="w-3 h-3" />
                       </button>
-                    )}
+                    </RoleGate>
                   </span>
                 ))}
               </div>
-              {isAdmin && (
+              <RoleGate roles={['ADMIN']}>
                 <div className="flex gap-2">
                   <input
                     value={aliasInput}
@@ -329,7 +327,7 @@ export function VendorsPage() {
                     Add Alias
                   </Button>
                 </div>
-              )}
+              </RoleGate>
             </div>
 
             <div>

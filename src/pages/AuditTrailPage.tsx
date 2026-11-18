@@ -14,7 +14,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, downloadCsv, formatDateTime } from '../lib/api';
 import {
   Button,
@@ -29,6 +29,7 @@ import {
 const ACTION_OPTIONS = [
   'ALL',
   'DECISION_GENERATED',
+  'AI_DECISION_EXPLAINED',
   'REVIEW_OVERRIDE_APPROVED',
   'REVIEW_OVERRIDE_REJECTED',
   'AI_REJECTION_DRAFT_GENERATED',
@@ -60,6 +61,14 @@ function formatAuditDecision(val: string | null | undefined) {
 
 function summarizeAuditDetails(row: any): { tag: string | null; text: string } {
   const d = (row.details || {}) as Record<string, any>;
+  if (row.action === 'AI_DECISION_EXPLAINED') {
+    return {
+      tag: d.model ? String(d.model) : 'GEMINI_FLASH',
+      text: d.explanation
+        ? String(d.explanation)
+        : `Generated Gemini Flash explanation (${d.primary_reason_code || 'DECISION'}).`,
+    };
+  }
   if (d.primary_reason_code || d.explanation) {
     return {
       tag: d.primary_reason_code ? String(d.primary_reason_code) : null,
@@ -136,7 +145,7 @@ function summarizeAuditDetails(row: any): { tag: string | null; text: string } {
 }
 
 export function AuditTrailPage() {
-  const { user } = useAuth();
+  const { role, hasAccess: isAuthorized } = useRole({ capability: 'view_audit_trail' });
   const [q, setQ] = useState('');
   const [action, setAction] = useState('ALL');
   const [resourceType, setResourceType] = useState('ALL');
@@ -146,8 +155,6 @@ export function AuditTrailPage() {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const pageSize = 25;
-
-  const isAuthorized = user?.role === 'REVIEWER' || user?.role === 'ADMIN';
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['audit-logs', q, action, resourceType, page],
@@ -168,9 +175,10 @@ export function AuditTrailPage() {
           403 — Access Restricted
         </h1>
         <p className="text-sm text-slate-500 dark:text-slate-400">
-          The immutable Audit Trail is restricted to <span className="font-mono">REVIEWER</span> and{' '}
+          The immutable Audit Trail is restricted to <span className="font-mono">REVIEWER</span>,{' '}
+          <span className="font-mono">AUDITOR</span>, and{' '}
           <span className="font-mono">ADMIN</span> roles. Your current role is{' '}
-          <span className="font-mono font-medium">{user?.role}</span>.
+          <span className="font-mono font-medium">{role}</span>.
         </p>
         <div className="pt-2">
           <Link to="/">

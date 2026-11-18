@@ -10,13 +10,15 @@ import {
   Film,
   ListChecks,
   Loader2,
+  Lock,
   Play,
   Trash2,
   UploadCloud,
   X,
   XCircle,
 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { useRole } from '../hooks/useRole';
 import { ApiError, apiFetch } from '../lib/api';
 import {
   Button,
@@ -96,6 +98,7 @@ function formatBytes(bytes: number): string {
 }
 
 export function UploadPage() {
+  const { canOperate } = useRole();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -121,6 +124,7 @@ export function UploadPage() {
   const { data: fixturesData } = useQuery({
     queryKey: ['fixtures'],
     queryFn: () => apiFetch<{ items: any[] }>('/fixtures'),
+    enabled: canOperate,
   });
 
   // Poll live pipeline status for any queued/running uploaded invoices in the queue
@@ -703,6 +707,35 @@ export function UploadPage() {
       (q.uploadStatus === 'queued' &&
         (q.processingStatus === 'COMPLETED' || q.processingStatus === 'FAILED'))
   ).length;
+
+  if (!canOperate) {
+    return (
+      <Card className="p-10 text-center max-w-lg mx-auto mt-10 space-y-3">
+        <div className="w-10 h-10 rounded-lg bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 flex items-center justify-center mx-auto">
+          <Lock className="w-5 h-5" />
+        </div>
+        <h1 className="text-lg font-display font-semibold text-slate-900 dark:text-slate-100">
+          Read-Only Compliance Access
+        </h1>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          The <span className="font-mono font-medium">AUDITOR</span> role has read-only access to invoices,
+          analytics, and the immutable Audit Trail and cannot upload files or initiate processing runs.
+        </p>
+        <div className="pt-2 flex items-center justify-center gap-2">
+          <Link to="/invoices">
+            <Button variant="secondary" size="sm">
+              Browse Invoices
+            </Button>
+          </Link>
+          <Link to="/audit">
+            <Button variant="primary" size="sm">
+              Open Audit Trail
+            </Button>
+          </Link>
+        </div>
+      </Card>
+    );
+  }
 
   return (
     <div className="space-y-6 max-w-5xl">

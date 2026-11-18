@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import { config } from './config.ts';
 import { getDb, isoNow } from './db.ts';
 
-export type UserRole = 'OPERATOR' | 'REVIEWER' | 'ADMIN';
+export type UserRole = 'OPERATOR' | 'REVIEWER' | 'AUDITOR' | 'ADMIN';
 
 export interface AuthUser {
   id: string;
@@ -93,12 +93,27 @@ function getDemoUserByRole(role: UserRole = 'ADMIN'): AuthUser | null {
 }
 
 export function getUserFromRequest(req: Request): AuthUser | null {
-  const headerRole = String(
-    req.header('X-Demo-Role') ?? req.query?.demo_role ?? ''
-  ).toUpperCase() as UserRole;
-  if (config.pauseAuthForDemo && ['OPERATOR', 'REVIEWER', 'ADMIN'].includes(headerRole)) {
-    const demoUser = getDemoUserByRole(headerRole);
-    if (demoUser) return demoUser;
+  if (config.pauseAuthForDemo || config.enableDemoRoleSwitcher) {
+    const headerUserId = String(
+      req.header('X-Demo-User-Id') ?? req.query?.demo_user_id ?? ''
+    ).trim();
+    if (headerUserId) {
+      const db = getDb();
+      const targetUser = db
+        .prepare(
+          'SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE id = ? AND is_active = 1'
+        )
+        .get(headerUserId) as AuthUser | undefined;
+      if (targetUser) return targetUser;
+    }
+
+    const headerRole = String(
+      req.header('X-Demo-Role') ?? req.query?.demo_role ?? ''
+    ).toUpperCase() as UserRole;
+    if (['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(headerRole)) {
+      const demoUser = getDemoUserByRole(headerRole);
+      if (demoUser) return demoUser;
+    }
   }
 
   const token = req.cookies?.[config.sessionCookieName];

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Search, ShoppingCart } from 'lucide-react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useAuth } from '../context/AuthContext';
+import { useRole } from '../hooks/useRole';
 import { apiFetch, formatCurrency, formatShortDate } from '../lib/api';
 import {
   Button,
@@ -18,7 +18,7 @@ import {
 export function PurchaseOrdersPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { user } = useAuth();
+  const { RoleGate } = useRole();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [q, setQ] = useState('');
@@ -88,8 +88,6 @@ export function PurchaseOrdersPage() {
     },
   });
 
-  const isAdmin = user?.role === 'ADMIN';
-
   return (
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -101,12 +99,12 @@ export function PurchaseOrdersPage() {
             Procurement budget commitments, cumulative invoice drawdowns, and remaining balances
           </p>
         </div>
-        {isAdmin && (
+        <RoleGate roles={['ADMIN']}>
           <Button variant="primary" onClick={() => setCreateOpen(true)}>
             <Plus className="w-4 h-4" />
             Create PO
           </Button>
-        )}
+        </RoleGate>
       </div>
 
       <Card className="p-3.5 flex flex-wrap items-center gap-3">
@@ -239,7 +237,7 @@ export function PurchaseOrdersPage() {
               </div>
             </div>
 
-            {isAdmin && (
+            <RoleGate roles={['ADMIN']}>
               <div className="flex items-center justify-between p-3 rounded-md border border-slate-200 dark:border-slate-800 text-xs">
                 <span>
                   Status: <strong className="font-mono">{detailData.purchase_order.status}</strong>
@@ -266,7 +264,7 @@ export function PurchaseOrdersPage() {
                   </Button>
                 )}
               </div>
-            )}
+            </RoleGate>
 
             <div>
               <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2">
