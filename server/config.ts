@@ -18,6 +18,17 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(FIXTURES_DIR, { recursive: true });
 
+const tursoUrl = (process.env.TURSO_DATABASE_URL || process.env.DATABASE_URL || '').trim();
+const databaseUrl = tursoUrl || `file:${path.join(DATA_DIR, 'invoicedesk.db')}`;
+const usesSharedDatabase = !databaseUrl.startsWith('file:');
+
+if (isServerless && !usesSharedDatabase) {
+  console.warn(
+    '[invoicedesk] Running serverless without TURSO_DATABASE_URL. Data lives in this instance\'s /tmp and ' +
+      'will NOT be visible to other instances (uploads will appear to vanish). Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.'
+  );
+}
+
 const pauseAuthForDemo =
   (process.env.PAUSE_AUTH_FOR_DEMO ?? 'true').toLowerCase() === 'true';
 const explicitRoleSwitcher = process.env.ENABLE_DEMO_ROLE_SWITCHER?.trim().toLowerCase();
@@ -35,7 +46,7 @@ export const config = {
         pauseAuthForDemo,
   pauseAuthForDemo,
   geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
-  geminiModel: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-4-argon',
   geminiFallbackModel: 'gemini-3.1-flash-lite',
   jwtSecret:
     process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 16
@@ -44,7 +55,16 @@ export const config = {
   sessionCookieName: 'invoicedesk_session',
   signedOutCookieName: 'invoicedesk_signed_out',
   dataDir: DATA_DIR,
-  dbPath: path.join(DATA_DIR, 'invoicedesk.db'),
+  databaseUrl,
+  // The Vercel Marketplace Turso integration prefixes its variables (e.g. TURSO_DATABASE_TURSO_AUTH_TOKEN).
+  databaseAuthToken: (
+    process.env.TURSO_AUTH_TOKEN ||
+    process.env.DATABASE_AUTH_TOKEN ||
+    process.env.TURSO_DATABASE_TURSO_AUTH_TOKEN ||
+    Object.entries(process.env).find(([k, v]) => k.endsWith('TURSO_AUTH_TOKEN') && v)?.[1] ||
+    ''
+  ).trim(),
+  usesSharedDatabase,
   storageDir: STORAGE_DIR,
   fixturesDir: FIXTURES_DIR,
   maxUploadBytes: 25 * 1024 * 1024,

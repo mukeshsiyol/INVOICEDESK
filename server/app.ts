@@ -1,6 +1,6 @@
 import cookieParser from 'cookie-parser';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { isoNow } from './db.ts';
+import { ensureSchema, isoNow } from './db.ts';
 import { seedInitialDatabase } from './fixtures.ts';
 import { recoverStaleRuns } from './pipeline.ts';
 import { createApiRouter } from './routes.ts';
@@ -11,8 +11,9 @@ let appPromise: Promise<Express> | null = null;
 export async function ensureBackendInitialized(): Promise<void> {
   if (!initPromise) {
     initPromise = (async () => {
+      await ensureSchema();
       await seedInitialDatabase();
-      recoverStaleRuns();
+      await recoverStaleRuns();
     })().catch((err) => {
       initPromise = null;
       throw err;

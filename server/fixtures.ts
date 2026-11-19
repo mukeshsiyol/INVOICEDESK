@@ -5,7 +5,8 @@ import zlib from 'node:zlib';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { hashPassword } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow, safeRollback } from './db.ts';
+import { getDb, isoNow } from './db.ts';
+import { persistValidatedPdf } from './extraction.ts';
 import { buildExplanationRecord } from './explanation.ts';
 import {
   DEFAULT_REJECTION_BODY_TEMPLATE,
@@ -520,23 +521,27 @@ export async function regenerateSeededInvoicePdfIfMissing(invoiceId: string): Pr
     total: spec.total,
   });
   const sha = crypto.createHash('sha256').update(pdfBuf).digest('hex');
-  const dir = path.join(config.storageDir, invoiceId);
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, `${sha}.pdf`), pdfBuf);
+  await persistValidatedPdf({ invoiceId, fileSha256: sha, buffer: Buffer.from(pdfBuf) });
   return pdfBuf;
 }
 
 export async function seedInitialDatabase(): Promise<void> {
+  // One write transaction so concurrent cold starts against a shared database
+  // can't both decide the database is empty and seed it twice.
+  await getDb().transaction(seedInitialDatabaseUnlocked);
+}
+
+async function seedInitialDatabaseUnlocked(): Promise<void> {
   const db = getDb();
-  const userCount = (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
+  const userCount = (await db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
   if (userCount > 0) {
     if (config.appEnv === 'demo' || config.pauseAuthForDemo) {
-      const hasAuditor = db
+      const hasAuditor = await db
         .prepare("SELECT 1 FROM users WHERE role = 'AUDITOR' LIMIT 1")
         .get();
       if (!hasAuditor) {
         const now = isoNow();
-        db.prepare(
+        await db.prepare(
           `INSERT OR IGNORE INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
            VALUES (?, ?, ?, ?, 'AUDITOR', 'light', 1, ?, ?)`
         ).run('usr-aud-004', 'auditor@invoicedesk.io', 'Marcus Vance', hashPassword('InvoiceDesk2026!'), now, now);
@@ -553,27 +558,27 @@ export async function seedInitialDatabase(): Promise<void> {
   const auditorId = 'usr-aud-004';
   const defaultPass = hashPassword('InvoiceDesk2026!');
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
   ).run(adminId, 'admin@invoicedesk.io', 'Elena Rostova', defaultPass, 'ADMIN', now, now);
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
   ).run(reviewerId, 'reviewer@invoicedesk.io', 'David Park', defaultPass, 'REVIEWER', now, now);
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
   ).run(operatorId, 'operator@invoicedesk.io', 'Maya Lin', defaultPass, 'OPERATOR', now, now);
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
   ).run(auditorId, 'auditor@invoicedesk.io', 'Marcus Vance', defaultPass, 'AUDITOR', now, now);
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO application_settings (id, workspace_name, default_currency, max_upload_mb, ocr_min_chars_per_page, force_ocr, tolerance_pct, tolerance_abs, tolerance_mode, confidence_threshold, auto_approve_max_amount, reviewer_approval_limit, enforce_separation_of_duties, rejection_email_subject_template, rejection_email_body_template, updated_by, updated_at)
      VALUES (1, 'InvoiceDesk', 'USD', 25, 50, 0, '2.00', '10.0000', 'MIN_OF_PCT_AND_ABS', '0.850', '25000.0000', '10000.0000', 1, ?, ?, ?, ?)`
   ).run(DEFAULT_REJECTION_SUBJECT_TEMPLATE, DEFAULT_REJECTION_BODY_TEMPLATE, adminId, now);
@@ -628,7 +633,7 @@ export async function seedInitialDatabase(): Promise<void> {
   ];
 
   for (const v of vendors) {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO vendors (id, vendor_code, canonical_name, normalized_name, aliases, tax_id, default_currency, verification_status, payment_terms_days, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'USD', ?, 30, ?, ?)`
     ).run(v.id, v.code, v.name, v.norm, JSON.stringify(v.aliases), v.taxId, v.status, now, now);
@@ -709,13 +714,13 @@ export async function seedInitialDatabase(): Promise<void> {
   ];
 
   for (const po of pos) {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO purchase_orders (id, po_number, normalized_po_number, vendor_id, currency, original_amount, consumed_amount, status, issued_date, notes, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?)`
     ).run(po.id, po.poNumber, po.normPo, po.vendorId, po.orig, po.consumed, po.status, po.issued, po.notes, now, now);
 
     for (const l of po.lines) {
-      db.prepare(
+      await db.prepare(
         `INSERT INTO purchase_order_lines (id, purchase_order_id, line_number, description, quantity, unit_price, line_total)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(crypto.randomUUID(), po.id, l.num, l.desc, l.qty, l.unit, l.tot);
@@ -761,12 +766,9 @@ export async function seedInitialDatabase(): Promise<void> {
       total: opts.total,
     });
     const sha = crypto.createHash('sha256').update(pdfBuf).digest('hex');
-    const dir = path.join(config.storageDir, opts.invId);
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(path.join(dir, `${sha}.pdf`), pdfBuf);
-    const storageKey = path.relative(config.dataDir, path.join(dir, `${sha}.pdf`));
+    const storageKey = await persistValidatedPdf({ invoiceId: opts.invId, fileSha256: sha, buffer: Buffer.from(pdfBuf) });
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO invoices (id, uploaded_by, original_filename, storage_key, file_sha256, file_size_bytes, page_count, document_type, vendor_id, extracted_vendor_name, purchase_order_id, extracted_po_number, invoice_number, normalized_invoice_number, invoice_date, due_date, currency, subtotal_amount, tax_amount, discount_amount, total_amount, overall_confidence, po_consumed_applied, processing_status, business_decision, review_status, latest_run_id, latest_decision_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 1, 'INVOICE', ?, ?, ?, ?, ?, ?, ?, '2026-12-01', 'USD', ?, ?, '0.00', ?, 0.9600, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?)`
     ).run(
@@ -795,12 +797,12 @@ export async function seedInitialDatabase(): Promise<void> {
       createdAt
     );
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO processing_runs (id, invoice_id, run_number, trigger_type, triggered_by, status, current_stage, extraction_mode, started_at, completed_at, duration_ms, created_at)
        VALUES (?, ?, 1, 'INITIAL', ?, 'COMPLETED', 8, 'NATIVE_TEXT', ?, ?, 2410, ?)`
     ).run(opts.runId, opts.invId, operatorId, createdAt, createdAt, createdAt);
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO invoice_lines (id, invoice_id, run_id, line_number, description, is_bundled, quantity, unit_price, tax_amount, line_total)
        VALUES (?, ?, ?, 1, 'Historical Baseline Service Period', 0, '1', ?, ?, ?)`
     ).run(crypto.randomUUID(), opts.invId, opts.runId, opts.subtotal, opts.tax, opts.subtotal);
@@ -816,7 +818,7 @@ export async function seedInitialDatabase(): Promise<void> {
       `Final Decision: ${opts.outcome} (${opts.reasonCode})`,
     ];
     for (let s = 1; s <= 8; s++) {
-      db.prepare(
+      await db.prepare(
         `INSERT INTO stage_events (run_id, stage_number, stage_code, status, summary, duration_ms, evidence_json, created_at)
          VALUES (?, ?, ?, 'COMPLETED', ?, 300, '{}', ?)`
       ).run(opts.runId, s, `STAGE_${s}`, stages[s - 1], createdAt);
@@ -863,7 +865,7 @@ export async function seedInitialDatabase(): Promise<void> {
       fallbackReason: opts.explanation,
     });
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO decisions (
          id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
          explanation_source, explanation_provider, explanation_model, explanation_prompt_version,
@@ -890,7 +892,7 @@ export async function seedInitialDatabase(): Promise<void> {
       createdAt
     );
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO audit_logs (actor_id, actor_type, actor_role, action, resource_type, resource_id, original_decision, new_decision, details_json, created_at)
        VALUES (NULL, 'SYSTEM', 'ENGINE', 'DECISION_GENERATED', 'INVOICE', ?, ?, ?, ?, ?)`
     ).run(
@@ -969,7 +971,7 @@ export async function seedInitialDatabase(): Promise<void> {
   });
 
   const seededReviewTs = new Date(Date.now() - 86400_000).toISOString();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO notifications (event_type, severity, title, message, invoice_id, run_id, metadata_json, created_at)
      VALUES ('MANUAL_REVIEW_REQUIRED', 'WARNING', 'Manual Review Required', ?, 'inv-seed-003', 'run-seed-003', ?, ?)`
   ).run(
@@ -981,9 +983,9 @@ export async function seedInitialDatabase(): Promise<void> {
 
 export async function resetDemoDatabase(): Promise<void> {
   const db = getDb();
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    db.exec(`
+  await db.transaction(async () => {
+    await db.exec(`
+      DELETE FROM documents;
       DELETE FROM notification_reads;
       DELETE FROM notifications;
       DELETE FROM review_actions;
@@ -999,11 +1001,7 @@ export async function resetDemoDatabase(): Promise<void> {
       DELETE FROM application_settings;
       DELETE FROM users;
     `);
-    db.exec('COMMIT;');
-  } catch (err) {
-    safeRollback(db);
-    throw err;
-  }
+  });
 
   await fs.rm(config.storageDir, { recursive: true, force: true });
   await fs.mkdir(config.storageDir, { recursive: true });

@@ -18,7 +18,7 @@ import {
   type UserRole,
 } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow, safeRollback, withTransaction } from './db.ts';
+import { getDb, isoNow, withTransaction } from './db.ts';
 import { normalizeDocNumber, normalizeVendorName, parseDecimalSafe } from './engine.ts';
 import { buildExplanationRecord } from './explanation.ts';
 import {
@@ -196,7 +196,7 @@ function buildInvoiceFilterQuery(query: Request['query'], idsParam: string[] = [
   return { whereSql: where.join(' AND '), params, orderBy };
 }
 
-function buildVendorReportRows(
+async function buildVendorReportRows(
   db: ReturnType<typeof getDb>,
   opts: { q?: string; status?: string; vendorId?: string; window?: string }
 ) {
@@ -206,7 +206,7 @@ function buildVendorReportRows(
   const win = String(opts.window ?? 'all').trim();
   const startIso = win && win !== 'all' ? windowStartIso(win) : null;
 
-  const vendors = (db.prepare('SELECT * FROM vendors ORDER BY vendor_code ASC').all() as any[])
+  const vendors = (await db.prepare('SELECT * FROM vendors ORDER BY vendor_code ASC').all() as any[])
     .map((v) => ({
       ...v,
       aliases: safeJsonParse<string[]>(v.aliases, []),
@@ -223,14 +223,14 @@ function buildVendorReportRows(
       );
     });
 
-  const allPos = db
+  const allPos = await db
     .prepare('SELECT id, vendor_id, currency, original_amount, consumed_amount, status FROM purchase_orders')
     .all() as any[];
 
   const invSql = startIso
     ? 'SELECT id, vendor_id, total_amount, overall_confidence, processing_status, business_decision, review_status, invoice_date, created_at FROM invoices WHERE created_at >= ?'
     : 'SELECT id, vendor_id, total_amount, overall_confidence, processing_status, business_decision, review_status, invoice_date, created_at FROM invoices';
-  const allInvoices = (startIso ? db.prepare(invSql).all(startIso) : db.prepare(invSql).all()) as any[];
+  const allInvoices = (startIso ? await db.prepare(invSql).all(startIso) : await db.prepare(invSql).all()) as any[];
 
   return vendors.map((v) => {
     const vendorPos = allPos.filter((p) => p.vendor_id === v.id);
@@ -339,18 +339,18 @@ async function ingestBufferAndQueueRun(params: {
   const now = isoNow();
   const safeDisplayFilename = path.basename(params.originalFilename).slice(0, 200) || 'invoice.pdf';
 
-  withTransaction(db, () => {
-    db.prepare(
+  await withTransaction(db, async () => {
+    await db.prepare(
       `INSERT INTO invoices (id, uploaded_by, original_filename, storage_key, file_sha256, file_size_bytes, processing_status, business_decision, review_status, latest_run_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', 'PENDING', 'NOT_REQUIRED', ?, ?, ?)`
     ).run(invoiceId, params.userId, safeDisplayFilename, storageKey, sha256, params.buffer.length, runId, now, now);
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO processing_runs (id, invoice_id, run_number, trigger_type, triggered_by, status, current_stage, created_at)
        VALUES (?, ?, 1, 'INITIAL', ?, 'QUEUED', 0, ?)`
     ).run(runId, invoiceId, params.userId, now);
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: params.userId,
       actorType: 'USER',
       actorRole: 'UPLOADER',
@@ -361,11 +361,11 @@ async function ingestBufferAndQueueRun(params: {
     });
   });
 
-  const uploaderRow = db
+  const uploaderRow = await db
     .prepare('SELECT full_name FROM users WHERE id = ?')
     .get(params.userId) as { full_name: string } | undefined;
 
-  createWorkspaceNotification({
+  await createWorkspaceNotification({
     eventType: 'INVOICE_UPLOADED',
     severity: 'INFO',
     title: 'New Invoice Uploaded',
@@ -380,7 +380,7 @@ async function ingestBufferAndQueueRun(params: {
     void startProcessingRun(runId);
   }
 
-  const persistedRun = db
+  const persistedRun = await db
     .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
     .get(runId) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
 
@@ -435,14 +435,14 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== AUTH ====================
-  router.post('/auth/login', (req, res) => {
+  router.post('/auth/login', async (req, res) => {
     const { email, password } = req.body ?? {};
     if (!email || !password) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'Email and password are required.');
       return;
     }
     const db = getDb();
-    const userRow = db
+    const userRow = await db
       .prepare('SELECT id, email, full_name, password_hash, role, theme_preference, is_active FROM users WHERE email = ?')
       .get(String(email).trim().toLowerCase()) as (AuthUser & { password_hash: string }) | undefined;
 
@@ -468,7 +468,7 @@ export function createApiRouter(): express.Router {
     res.json({ ok: true, auth_paused: config.pauseAuthForDemo });
   });
 
-  router.post('/auth/demo-bootstrap', (req, res) => {
+  router.post('/auth/demo-bootstrap', async (req, res) => {
     if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo) {
       sendError(req, res, 404, 'NOT_FOUND', 'Demo bootstrap disabled.');
       return;
@@ -477,14 +477,14 @@ export function createApiRouter(): express.Router {
       sendError(req, res, 401, 'SIGNED_OUT', 'User explicitly signed out.');
       return;
     }
-    const existing = getUserFromRequest(req);
+    const existing = await getUserFromRequest(req);
     if (existing) {
       setSessionCookie(res, signSessionToken(existing), req);
       res.json({ ...existing, demo_mode: config.enableDemoRoleSwitcher, auth_paused: config.pauseAuthForDemo });
       return;
     }
     const db = getDb();
-    const defaultUser = db
+    const defaultUser = await db
       .prepare("SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE role = 'ADMIN' AND is_active = 1 LIMIT 1")
       .get() as AuthUser | undefined;
     if (!defaultUser) {
@@ -499,13 +499,13 @@ export function createApiRouter(): express.Router {
     res.json({ ...req.user!, demo_mode: config.enableDemoRoleSwitcher, auth_paused: config.pauseAuthForDemo });
   });
 
-  router.get('/auth/users', requireAuth, (req, res) => {
+  router.get('/auth/users', requireAuth, async (req, res) => {
     if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo) {
       sendError(req, res, 404, 'NOT_FOUND', 'User switcher is disabled.');
       return;
     }
     const db = getDb();
-    const users = db
+    const users = await db
       .prepare(
         `SELECT id, email, full_name, role
          FROM users
@@ -522,7 +522,7 @@ export function createApiRouter(): express.Router {
     res.json({ items: users });
   });
 
-  router.post('/auth/demo-switch', (req, res) => {
+  router.post('/auth/demo-switch', async (req, res) => {
     if (!config.enableDemoRoleSwitcher && !config.pauseAuthForDemo) {
       sendError(req, res, 404, 'NOT_FOUND', 'Demo role switcher is disabled.');
       return;
@@ -532,7 +532,7 @@ export function createApiRouter(): express.Router {
     let target: AuthUser | undefined;
 
     if (userId) {
-      target = db
+      target = await db
         .prepare('SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE id = ? AND is_active = 1 LIMIT 1')
         .get(userId) as AuthUser | undefined;
       if (!target) {
@@ -545,7 +545,7 @@ export function createApiRouter(): express.Router {
         sendError(req, res, 422, 'VALIDATION_ERROR', 'Role must be OPERATOR, REVIEWER, AUDITOR, or ADMIN.');
         return;
       }
-      target = db
+      target = await db
         .prepare('SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE role = ? AND is_active = 1 ORDER BY created_at ASC LIMIT 1')
         .get(role) as AuthUser | undefined;
       if (!target) {
@@ -554,9 +554,9 @@ export function createApiRouter(): express.Router {
       }
     }
 
-    const prev = getUserFromRequest(req);
+    const prev = await getUserFromRequest(req);
     setSessionCookie(res, signSessionToken(target), req);
-    writeAuditLog({
+    await writeAuditLog({
       actorId: target.id,
       actorType: 'USER',
       actorRole: target.role,
@@ -594,12 +594,12 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== UPLOAD & PRECHECK ====================
-  router.post('/invoices/precheck-hash', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), (req, res) => {
+  router.post('/invoices/precheck-hash', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const hashes = Array.isArray(req.body?.hashes) ? req.body.hashes.slice(0, 50) : [];
     const db = getDb();
-    const matches = hashes.map((h: { client_id?: string; sha256?: string }) => {
+    const matches = await Promise.all(hashes.map(async (h: { client_id?: string; sha256?: string }) => {
       if (!h?.sha256) return { client_id: h?.client_id, is_duplicate: false };
-      const existing = db
+      const existing = await db
         .prepare(
           `SELECT id, original_filename, invoice_number, business_decision
            FROM invoices WHERE file_sha256 = ? AND processing_status = 'COMPLETED'
@@ -617,7 +617,7 @@ export function createApiRouter(): express.Router {
         existing_invoice_number: existing.invoice_number,
         existing_decision: existing.business_decision,
       };
-    });
+    }));
     res.json({ matches });
   });
 
@@ -648,7 +648,7 @@ export function createApiRouter(): express.Router {
       }
 
       const db = getDb();
-      const vendorRows = db
+      const vendorRows = await db
         .prepare('SELECT id, canonical_name, aliases FROM vendors')
         .all() as Array<{ id: string; canonical_name: string; aliases: string }>;
       const knownVendors = vendorRows.map((v) => {
@@ -662,7 +662,7 @@ export function createApiRouter(): express.Router {
         return { id: v.id, canonical_name: v.canonical_name, aliases };
       });
 
-      const existingInvoices = db
+      const existingInvoices = await db
         .prepare(
           `SELECT i.id, i.original_filename, i.file_sha256, i.vendor_id, i.extracted_vendor_name,
                   v.canonical_name AS vendor_canonical_name,
@@ -1099,14 +1099,14 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== INVOICES LIST, EXPORT, DETAIL, DOCUMENT ====================
-  router.get('/invoices', requireAuth, (req, res) => {
+  router.get('/invoices', requireAuth, async (req, res) => {
     const db = getDb();
     const page = parsePositiveInt(req.query.page, 1, 10_000);
     const pageSize = parsePositiveInt(req.query.page_size, 20, 100);
     const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query);
 
     const total = (
-      db
+      await db
         .prepare(
           `SELECT COUNT(*) AS c
            FROM invoices i
@@ -1117,7 +1117,7 @@ export function createApiRouter(): express.Router {
         .get(...params) as { c: number }
     ).c;
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.verification_status AS vendor_verification_status,
                 po.po_number AS matched_po_number, d.primary_reason_code, d.explanation AS decision_explanation,
@@ -1136,7 +1136,7 @@ export function createApiRouter(): express.Router {
     res.json({ items: rows, total, page, page_size: pageSize });
   });
 
-  router.get('/invoices/export', requireAuth, (req, res) => {
+  router.get('/invoices/export', requireAuth, async (req, res) => {
     const db = getDb();
     const idsParam = req.query.ids
       ? String(req.query.ids)
@@ -1147,7 +1147,7 @@ export function createApiRouter(): express.Router {
       : [];
     const { whereSql, params, orderBy } = buildInvoiceFilterQuery(req.query, idsParam);
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT i.id, i.invoice_number, i.document_type, i.original_filename,
                 COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
@@ -1200,9 +1200,9 @@ export function createApiRouter(): express.Router {
     res.send(csv);
   });
 
-  router.get('/invoices/:invoiceId', requireAuth, (req, res) => {
+  router.get('/invoices/:invoiceId', requireAuth, async (req, res) => {
     const db = getDb();
-    const invoice = db
+    const invoice = await db
       .prepare(
         `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.vendor_code, v.verification_status AS vendor_verification_status,
                 po.po_number AS matched_po_number, po.original_amount AS po_original_amount, po.consumed_amount AS po_consumed_amount,
@@ -1220,7 +1220,7 @@ export function createApiRouter(): express.Router {
     }
 
     const requestedRunId = req.query.run_id ? String(req.query.run_id) : invoice.latest_run_id;
-    const runsHistory = db
+    const runsHistory = await db
       .prepare(
         `SELECT id, run_number, trigger_type, status, current_stage, extraction_mode, error_stage, error_message, started_at, completed_at, duration_ms, created_at
          FROM processing_runs WHERE invoice_id = ? ORDER BY run_number DESC`
@@ -1229,11 +1229,11 @@ export function createApiRouter(): express.Router {
 
     const activeRun =
       (requestedRunId
-        ? db.prepare('SELECT * FROM processing_runs WHERE id = ? AND invoice_id = ?').get(requestedRunId, invoice.id)
+        ? await db.prepare('SELECT * FROM processing_runs WHERE id = ? AND invoice_id = ?').get(requestedRunId, invoice.id)
         : null) || runsHistory[0] || null;
 
     const stageEvents = activeRun
-      ? (db
+      ? (await db
           .prepare('SELECT * FROM stage_events WHERE run_id = ? ORDER BY id ASC')
           .all(activeRun.id) as any[]).map((ev) => ({
           ...ev,
@@ -1242,11 +1242,11 @@ export function createApiRouter(): express.Router {
       : [];
 
     const lineItems = activeRun
-      ? db.prepare('SELECT * FROM invoice_lines WHERE run_id = ? ORDER BY line_number ASC').all(activeRun.id)
+      ? await db.prepare('SELECT * FROM invoice_lines WHERE run_id = ? ORDER BY line_number ASC').all(activeRun.id)
       : [];
 
     const decisionRow = activeRun
-      ? (db.prepare('SELECT * FROM decisions WHERE run_id = ?').get(activeRun.id) as any)
+      ? (await db.prepare('SELECT * FROM decisions WHERE run_id = ?').get(activeRun.id) as any)
       : null;
     const decision = decisionRow
       ? {
@@ -1257,7 +1257,7 @@ export function createApiRouter(): express.Router {
         }
       : null;
 
-    const reviewActions = db
+    const reviewActions = await db
       .prepare(
         `SELECT ra.*, u.full_name AS reviewer_name, u.email AS reviewer_email, u.role AS reviewer_role
          FROM review_actions ra
@@ -1267,7 +1267,7 @@ export function createApiRouter(): express.Router {
       .all(invoice.id);
 
     const priorPoInvoices = invoice.purchase_order_id
-      ? db
+      ? await db
           .prepare(
             `SELECT id, invoice_number, original_filename, total_amount, business_decision, review_status, created_at
              FROM invoices WHERE purchase_order_id = ? AND po_consumed_applied = 1 AND id != ?
@@ -1292,7 +1292,7 @@ export function createApiRouter(): express.Router {
 
   router.get('/invoices/:invoiceId/document', requireAuth, async (req, res) => {
     const db = getDb();
-    const inv = db
+    const inv = await db
       .prepare('SELECT id, original_filename, storage_key FROM invoices WHERE id = ?')
       .get(req.params.invoiceId) as { id: string; original_filename: string; storage_key: string } | undefined;
 
@@ -1323,16 +1323,16 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.get('/invoices/:invoiceId/ocr-text', requireAuth, (req, res) => {
+  router.get('/invoices/:invoiceId/ocr-text', requireAuth, async (req, res) => {
     const db = getDb();
-    const inv = db.prepare('SELECT latest_run_id FROM invoices WHERE id = ?').get(req.params.invoiceId) as
+    const inv = await db.prepare('SELECT latest_run_id FROM invoices WHERE id = ?').get(req.params.invoiceId) as
       | { latest_run_id: string | null }
       | undefined;
     if (!inv?.latest_run_id) {
       sendError(req, res, 404, 'NOT_FOUND', 'Extraction data not found.');
       return;
     }
-    const run = db
+    const run = await db
       .prepare('SELECT extraction_mode, raw_extracted_json FROM processing_runs WHERE id = ?')
       .get(inv.latest_run_id) as { extraction_mode: string | null; raw_extracted_json: string | null } | undefined;
 
@@ -1350,7 +1350,7 @@ export function createApiRouter(): express.Router {
 
   router.post('/invoices/:invoiceId/start', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
-    const inv = db
+    const inv = await db
       .prepare('SELECT id, latest_run_id, processing_status FROM invoices WHERE id = ?')
       .get(req.params.invoiceId) as
       | { id: string; latest_run_id: string | null; processing_status: string }
@@ -1362,7 +1362,7 @@ export function createApiRouter(): express.Router {
     }
 
     const ifQueued = req.body?.if_queued === true;
-    const run = db
+    const run = await db
       .prepare('SELECT id, run_number, status, started_at, error_stage, error_message FROM processing_runs WHERE id = ?')
       .get(inv.latest_run_id) as
       | { id: string; run_number: number; status: string; started_at: string | null; error_stage: number | null; error_message: string | null }
@@ -1386,7 +1386,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -1400,7 +1400,7 @@ export function createApiRouter(): express.Router {
     if (config.isServerless) {
       await p;
     }
-    const finishedRun = db
+    const finishedRun = await db
       .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
       .get(run.id) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
     res.status(202).json({
@@ -1416,7 +1416,7 @@ export function createApiRouter(): express.Router {
 
   router.post('/invoices/:invoiceId/retry', requireAuth, requireRoles('OPERATOR', 'REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
-    const inv = db
+    const inv = await db
       .prepare(
         'SELECT id, processing_status, purchase_order_id, total_amount, po_consumed_applied FROM invoices WHERE id = ?'
       )
@@ -1441,11 +1441,11 @@ export function createApiRouter(): express.Router {
     const newRunId = crypto.randomUUID();
     const now = isoNow();
 
-    const nextRunNumber = withTransaction(db, () => {
+    const nextRunNumber = await withTransaction(db, async () => {
       // Reverse prior PO consumption if this invoice previously debited a PO so retry evaluates cleanly
       if (inv.po_consumed_applied === 1 && inv.purchase_order_id && inv.total_amount) {
         const totalDec = parseDecimalSafe(inv.total_amount);
-        const po = db
+        const po = await db
           .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
           .get(inv.purchase_order_id) as
           | { id: string; original_amount: string; consumed_amount: string; status: string }
@@ -1459,7 +1459,7 @@ export function createApiRouter(): express.Router {
             : nextConsumed.gt(0)
               ? 'PARTIALLY_CONSUMED'
               : 'OPEN';
-          db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
+          await db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
             nextConsumed.toFixed(4),
             nextPoStatus,
             now,
@@ -1468,17 +1468,17 @@ export function createApiRouter(): express.Router {
         }
       }
 
-      const lastRun = db
+      const lastRun = await db
         .prepare('SELECT MAX(run_number) AS max_num FROM processing_runs WHERE invoice_id = ?')
         .get(inv.id) as { max_num: number | null };
       const runNumber = (lastRun?.max_num ?? 0) + 1;
 
-      db.prepare(
+      await db.prepare(
         `INSERT INTO processing_runs (id, invoice_id, run_number, trigger_type, triggered_by, status, current_stage, created_at)
          VALUES (?, ?, ?, 'RETRY', ?, 'QUEUED', 0, ?)`
       ).run(newRunId, inv.id, runNumber, req.user!.id, now);
 
-      db.prepare(
+      await db.prepare(
         `UPDATE invoices SET
            processing_status = 'QUEUED',
            business_decision = 'PENDING',
@@ -1492,7 +1492,7 @@ export function createApiRouter(): express.Router {
          WHERE id = ?`
       ).run(newRunId, now, inv.id);
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: req.user!.id,
         actorType: 'USER',
         actorRole: req.user!.role,
@@ -1508,7 +1508,7 @@ export function createApiRouter(): express.Router {
     if (!config.isServerless) {
       void startProcessingRun(newRunId);
     }
-    const persistedRun = db
+    const persistedRun = await db
       .prepare('SELECT status, error_stage, error_message FROM processing_runs WHERE id = ?')
       .get(newRunId) as { status: string; error_stage: number | null; error_message: string | null } | undefined;
     res.status(202).json({
@@ -1524,7 +1524,7 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== PROCESSING RUNS & SSE STREAM ====================
-  router.get('/runs', requireAuth, (req, res) => {
+  router.get('/runs', requireAuth, async (req, res) => {
     const db = getDb();
     const status = String(req.query.status ?? '').trim();
     const page = parsePositiveInt(req.query.page, 1, 10_000);
@@ -1534,10 +1534,10 @@ export function createApiRouter(): express.Router {
     const params = status && status !== 'ALL' ? [status] : [];
 
     const total = (
-      db.prepare(`SELECT COUNT(*) AS c FROM processing_runs r ${where}`).get(...params) as { c: number }
+      await db.prepare(`SELECT COUNT(*) AS c FROM processing_runs r ${where}`).get(...params) as { c: number }
     ).c;
 
-    const items = db
+    const items = await db
       .prepare(
         `SELECT r.*, i.original_filename, i.invoice_number, i.business_decision, i.total_amount, i.currency,
                 COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name
@@ -1553,23 +1553,23 @@ export function createApiRouter(): express.Router {
     res.json({ items, total, page, page_size: pageSize });
   });
 
-  router.get('/runs/:runId', requireAuth, (req, res) => {
+  router.get('/runs/:runId', requireAuth, async (req, res) => {
     const db = getDb();
-    const run = db.prepare('SELECT * FROM processing_runs WHERE id = ?').get(req.params.runId) as any;
+    const run = await db.prepare('SELECT * FROM processing_runs WHERE id = ?').get(req.params.runId) as any;
     if (!run) {
       sendError(req, res, 404, 'NOT_FOUND', 'Processing run not found.');
       return;
     }
     const events = (
-      db.prepare('SELECT * FROM stage_events WHERE run_id = ? ORDER BY id ASC').all(run.id) as any[]
+      await db.prepare('SELECT * FROM stage_events WHERE run_id = ? ORDER BY id ASC').all(run.id) as any[]
     ).map((ev) => ({ ...ev, evidence: safeJsonParse<Record<string, unknown>>(ev.evidence_json, {}) }));
     res.json({ run, stage_events: events });
   });
 
-  router.get('/runs/:runId/events', requireAuth, (req, res) => {
+  router.get('/runs/:runId/events', requireAuth, async (req, res) => {
     const runId = String(req.params.runId);
     const db = getDb();
-    const run = db.prepare('SELECT id, invoice_id, status, duration_ms FROM processing_runs WHERE id = ?').get(runId) as
+    const run = await db.prepare('SELECT id, invoice_id, status, duration_ms FROM processing_runs WHERE id = ?').get(runId) as
       | { id: string; invoice_id: string; status: string; duration_ms: number | null }
       | undefined;
 
@@ -1596,8 +1596,8 @@ export function createApiRouter(): express.Router {
       safeSseWrite(res, `id: ${payload.id}\nevent: ${payload.event}\ndata: ${JSON.stringify(payload.data)}\n\n`);
     };
 
-    const replayAndCheckTerminal = (): boolean => {
-      const missed = db
+    const replayAndCheckTerminal = async (): Promise<boolean> => {
+      const missed = await db
         .prepare('SELECT * FROM stage_events WHERE run_id = ? AND id > ? ORDER BY id ASC')
         .all(runId, lastSentId) as any[];
 
@@ -1625,7 +1625,7 @@ export function createApiRouter(): express.Router {
         });
       }
 
-      const currentRun = db
+      const currentRun = await db
         .prepare('SELECT status, error_stage, error_message, duration_ms FROM processing_runs WHERE id = ?')
         .get(runId) as
         | { status: string; error_stage: number | null; error_message: string | null; duration_ms: number | null }
@@ -1637,7 +1637,7 @@ export function createApiRouter(): express.Router {
       }
 
       if (currentRun.status === 'COMPLETED') {
-        const inv = db
+        const inv = await db
           .prepare('SELECT business_decision, review_status FROM invoices WHERE id = ?')
           .get(run.invoice_id) as { business_decision: string; review_status: string } | undefined;
         safeSseWrite(
@@ -1673,7 +1673,7 @@ export function createApiRouter(): express.Router {
       return false;
     };
 
-    if (replayAndCheckTerminal()) {
+    if (await replayAndCheckTerminal()) {
       return;
     }
 
@@ -1692,8 +1692,8 @@ export function createApiRouter(): express.Router {
     }, 15000);
 
     const dbPoll = config.isServerless
-      ? setInterval(() => {
-          if (replayAndCheckTerminal()) {
+      ? setInterval(async () => {
+          if (await replayAndCheckTerminal()) {
             cleanup();
           }
         }, 1500)
@@ -1719,7 +1719,7 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== REVIEW QUEUE & OVERRIDES ====================
-  router.get('/reviews', requireAuth, (req, res) => {
+  router.get('/reviews', requireAuth, async (req, res) => {
     const db = getDb();
     const status = String(req.query.status ?? 'PENDING_REVIEW');
     const category = String(req.query.category ?? 'ALL');
@@ -1729,7 +1729,7 @@ export function createApiRouter(): express.Router {
       statusWhere = "i.review_status IN ('APPROVED_BY_HUMAN', 'REJECTED_BY_HUMAN')";
     }
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT i.*, COALESCE(v.canonical_name, i.extracted_vendor_name) AS vendor_name,
                 po.po_number AS matched_po_number, po.original_amount AS po_original_amount, po.consumed_amount AS po_consumed_amount,
@@ -1767,10 +1767,10 @@ export function createApiRouter(): express.Router {
     res.json({ items: mapped, total: mapped.length });
   });
 
-  router.post('/reviews/:invoiceId/assign', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+  router.post('/reviews/:invoiceId/assign', requireAuth, requireRoles('REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
     const reviewerId = String(req.body?.reviewer_id || req.user!.id).trim();
-    const targetReviewer = db
+    const targetReviewer = await db
       .prepare('SELECT id, full_name, role, is_active FROM users WHERE id = ?')
       .get(reviewerId) as { id: string; full_name: string; role: string; is_active: number } | undefined;
 
@@ -1785,7 +1785,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const inv = db
+    const inv = await db
       .prepare('SELECT id, latest_decision_id, review_status FROM invoices WHERE id = ?')
       .get(req.params.invoiceId) as { id: string; latest_decision_id: string | null; review_status: string } | undefined;
 
@@ -1805,18 +1805,18 @@ export function createApiRouter(): express.Router {
     }
 
     const now = isoNow();
-    withTransaction(db, () => {
-      db.prepare('UPDATE invoices SET assigned_reviewer_id = ?, updated_at = ? WHERE id = ?').run(
+    await withTransaction(db, async () => {
+      await db.prepare('UPDATE invoices SET assigned_reviewer_id = ?, updated_at = ? WHERE id = ?').run(
         reviewerId,
         now,
         inv.id
       );
-      db.prepare(
+      await db.prepare(
         `INSERT INTO review_actions (id, invoice_id, decision_id, reviewer_id, action, note, created_at)
          VALUES (?, ?, ?, ?, 'ASSIGN', ?, ?)`
       ).run(crypto.randomUUID(), inv.id, inv.latest_decision_id, req.user!.id, `Assigned reviewer ${targetReviewer.full_name}`, now);
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: req.user!.id,
         actorType: 'USER',
         actorRole: req.user!.role,
@@ -1830,7 +1830,7 @@ export function createApiRouter(): express.Router {
     res.json({ ok: true, assigned_reviewer_id: reviewerId, assigned_reviewer_name: targetReviewer.full_name });
   });
 
-  router.post('/invoices/:invoiceId/review', requireAuth, requireRoles('REVIEWER', 'ADMIN'), (req, res) => {
+  router.post('/invoices/:invoiceId/review', requireAuth, requireRoles('REVIEWER', 'ADMIN'), async (req, res) => {
     const action = String(req.body?.action ?? '');
     const note = String(req.body?.note ?? '').trim();
 
@@ -1853,9 +1853,8 @@ export function createApiRouter(): express.Router {
     const db = getDb();
     const now = isoNow();
 
-    db.exec('BEGIN IMMEDIATE;');
-    try {
-      const inv = db
+    const outcome = await db.transaction(async () => {
+      const inv = await db
         .prepare(
           `SELECT id, uploaded_by, invoice_number, original_filename, purchase_order_id, total_amount, po_consumed_applied, business_decision, review_status, latest_decision_id
            FROM invoices WHERE id = ?`
@@ -1863,18 +1862,15 @@ export function createApiRouter(): express.Router {
         .get(req.params.invoiceId) as any;
 
       if (!inv) {
-        safeRollback(db);
         sendError(req, res, 404, 'NOT_FOUND', 'Invoice not found.');
-        return;
+        return null;
       }
       if (!inv.latest_decision_id) {
-        safeRollback(db);
         sendError(req, res, 409, 'INVALID_STATE', 'Invoice has not completed automated processing yet.');
-        return;
+        return null;
       }
 
       if (inv.review_status !== 'PENDING_REVIEW') {
-        safeRollback(db);
         sendError(
           req,
           res,
@@ -1882,17 +1878,16 @@ export function createApiRouter(): express.Router {
           'CONCURRENT_REVIEW_CONFLICT',
           `This invoice was already resolved (${inv.review_status}).`
         );
-        return;
+        return null;
       }
 
-      const policySettings = db
+      const policySettings = await db
         .prepare('SELECT enforce_separation_of_duties, reviewer_approval_limit FROM application_settings WHERE id = 1')
         .get() as
         | { enforce_separation_of_duties?: number; reviewer_approval_limit?: string | null }
         | undefined;
 
       if ((policySettings?.enforce_separation_of_duties ?? 1) === 1 && inv.uploaded_by === req.user!.id) {
-        safeRollback(db);
         sendError(
           req,
           res,
@@ -1901,14 +1896,13 @@ export function createApiRouter(): express.Router {
           'Separation of duties prevents you from reviewing an invoice you uploaded. Another Reviewer or Administrator must resolve this exception.',
           { uploaded_by: inv.uploaded_by, actor_id: req.user!.id }
         );
-        return;
+        return null;
       }
 
       const limitDec = parseDecimalSafe(policySettings?.reviewer_approval_limit);
       const totalDec = parseDecimalSafe(inv.total_amount);
       if (action === 'APPROVE_OVERRIDE' && req.user!.role === 'REVIEWER' && limitDec && totalDec) {
         if (totalDec.gt(limitDec)) {
-          safeRollback(db);
           sendError(
             req,
             res,
@@ -1920,7 +1914,7 @@ export function createApiRouter(): express.Router {
               reviewer_approval_limit: limitDec.toFixed(2),
             }
           );
-          return;
+          return null;
         }
       }
 
@@ -1928,7 +1922,7 @@ export function createApiRouter(): express.Router {
 
       // Atomic PO debit on human approval if not already applied
       if (action === 'APPROVE_OVERRIDE' && inv.purchase_order_id && inv.po_consumed_applied === 0 && totalDec) {
-        const po = db
+        const po = await db
           .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
           .get(inv.purchase_order_id) as
           | { id: string; original_amount: string; consumed_amount: string; status: string }
@@ -1945,29 +1939,29 @@ export function createApiRouter(): express.Router {
                 : newConsumed.gt(0)
                   ? 'PARTIALLY_CONSUMED'
                   : 'OPEN';
-          db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
+          await db.prepare('UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?').run(
             newConsumed.toFixed(4),
             newPoStatus,
             now,
             po.id
           );
-          db.prepare('UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?').run(inv.id);
+          await db.prepare('UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?').run(inv.id);
         }
       }
 
-      db.prepare('UPDATE invoices SET review_status = ?, updated_at = ? WHERE id = ?').run(
+      await db.prepare('UPDATE invoices SET review_status = ?, updated_at = ? WHERE id = ?').run(
         newReviewStatus,
         now,
         inv.id
       );
 
       const actionId = crypto.randomUUID();
-      db.prepare(
+      await db.prepare(
         `INSERT INTO review_actions (id, invoice_id, decision_id, reviewer_id, action, note, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(actionId, inv.id, inv.latest_decision_id, req.user!.id, action, note, now);
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: req.user!.id,
         actorType: 'USER',
         actorRole: req.user!.role,
@@ -1979,35 +1973,35 @@ export function createApiRouter(): express.Router {
         details: { note, decision_id: inv.latest_decision_id, review_action_id: actionId },
       });
 
-      db.exec('COMMIT;');
+      return { inv, newReviewStatus, actionId };
+    });
 
-      createWorkspaceNotification({
-        eventType: 'REVIEW_RESOLVED',
-        severity: 'INFO',
-        title: action === 'APPROVE_OVERRIDE' ? 'Manual Review Approved' : 'Manual Review Rejected',
-        message: `${inv.invoice_number || inv.original_filename} resolved by ${req.user!.full_name} (${newReviewStatus}).`,
-        invoiceId: inv.id,
-        actorId: req.user!.id,
-        metadata: { action, review_status: newReviewStatus },
-      });
+    if (!outcome) return;
+    const { inv, newReviewStatus, actionId } = outcome;
 
-      res.json({
-        ok: true,
-        invoice_id: inv.id,
-        original_decision: inv.business_decision,
-        review_status: newReviewStatus,
-        review_action_id: actionId,
-      });
-    } catch (err) {
-      safeRollback(db);
-      throw err;
-    }
+    await createWorkspaceNotification({
+      eventType: 'REVIEW_RESOLVED',
+      severity: 'INFO',
+      title: action === 'APPROVE_OVERRIDE' ? 'Manual Review Approved' : 'Manual Review Rejected',
+      message: `${inv.invoice_number || inv.original_filename} resolved by ${req.user!.full_name} (${newReviewStatus}).`,
+      invoiceId: inv.id,
+      actorId: req.user!.id,
+      metadata: { action, review_status: newReviewStatus },
+    });
+
+    res.json({
+      ok: true,
+      invoice_id: inv.id,
+      original_decision: inv.business_decision,
+      review_status: newReviewStatus,
+      review_action_id: actionId,
+    });
   });
 
   // ==================== GEMINI FLASH DECISION EXPLANATION ====================
   router.post('/invoices/:invoiceId/explain', requireAuth, requireRoles('REVIEWER', 'ADMIN'), async (req, res) => {
     const db = getDb();
-    const inv = db
+    const inv = await db
       .prepare(
         `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.verification_status AS vendor_verification_status,
                 po.po_number AS matched_po_number
@@ -2034,7 +2028,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const decisionRow = db
+    const decisionRow = await db
       .prepare('SELECT * FROM decisions WHERE id = ?')
       .get(inv.latest_decision_id) as any;
 
@@ -2057,7 +2051,7 @@ export function createApiRouter(): express.Router {
         : [];
 
     if (candidatePos.length === 0 && inv.vendor_id) {
-      const openPos = db
+      const openPos = await db
         .prepare(
           `SELECT po_number, original_amount, consumed_amount, currency
            FROM purchase_orders
@@ -2153,7 +2147,7 @@ export function createApiRouter(): express.Router {
         updatedSnapshot.ai_reviewer_brief = aiReviewerBrief;
       }
 
-      db.prepare(
+      await db.prepare(
         `UPDATE decisions SET
            explanation = ?,
            evidence_snapshot = ?,
@@ -2184,7 +2178,7 @@ export function createApiRouter(): express.Router {
         decisionRow.id
       );
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: req.user!.id,
         actorType: 'USER',
         actorRole: req.user!.role,
@@ -2235,7 +2229,7 @@ export function createApiRouter(): express.Router {
         : null;
 
     const db = getDb();
-    const inv = db
+    const inv = await db
       .prepare(
         `SELECT i.*, v.canonical_name AS vendor_canonical_name, v.verification_status AS vendor_verification_status,
                 po.po_number AS matched_po_number
@@ -2251,7 +2245,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const decisionRow = db
+    const decisionRow = await db
       .prepare('SELECT * FROM decisions WHERE id = ?')
       .get(inv.latest_decision_id) as any;
 
@@ -2277,7 +2271,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const latestRejectOverride = db
+    const latestRejectOverride = await db
       .prepare(
         `SELECT ra.action, ra.note, ra.created_at, u.full_name AS reviewer_name, u.role AS reviewer_role
          FROM review_actions ra
@@ -2295,7 +2289,7 @@ export function createApiRouter(): express.Router {
         }
       | undefined;
 
-    const appSettings = db
+    const appSettings = await db
       .prepare(
         'SELECT workspace_name, rejection_email_subject_template, rejection_email_body_template FROM application_settings WHERE id = 1'
       )
@@ -2357,12 +2351,12 @@ export function createApiRouter(): express.Router {
         ...evidenceSnapshot,
         ai_rejection_notice: draft,
       };
-      db.prepare('UPDATE decisions SET evidence_snapshot = ? WHERE id = ?').run(
+      await db.prepare('UPDATE decisions SET evidence_snapshot = ? WHERE id = ?').run(
         JSON.stringify(updatedSnapshot),
         decisionRow.id
       );
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: req.user!.id,
         actorType: 'USER',
         actorRole: req.user!.role,
@@ -2399,12 +2393,12 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== VENDORS ====================
-  router.get('/vendors', requireAuth, (req, res) => {
+  router.get('/vendors', requireAuth, async (req, res) => {
     const db = getDb();
     const q = String(req.query.q ?? '').trim().toLowerCase();
     const status = String(req.query.status ?? '').trim();
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT v.*,
                 (SELECT COUNT(*) FROM purchase_orders po WHERE po.vendor_id = v.id AND po.status IN ('OPEN','PARTIALLY_CONSUMED')) AS open_po_count,
@@ -2434,9 +2428,9 @@ export function createApiRouter(): express.Router {
     res.json({ items, total: items.length });
   });
 
-  router.get('/vendors/report', requireAuth, (req, res) => {
+  router.get('/vendors/report', requireAuth, async (req, res) => {
     const db = getDb();
-    const items = buildVendorReportRows(db, {
+    const items = await buildVendorReportRows(db, {
       q: String(req.query.q ?? ''),
       status: String(req.query.status ?? ''),
       vendorId: String(req.query.vendor_id ?? ''),
@@ -2445,9 +2439,9 @@ export function createApiRouter(): express.Router {
     res.json({ items, total: items.length });
   });
 
-  router.get('/vendors/export', requireAuth, (req, res) => {
+  router.get('/vendors/export', requireAuth, async (req, res) => {
     const db = getDb();
-    const rows = buildVendorReportRows(db, {
+    const rows = await buildVendorReportRows(db, {
       q: String(req.query.q ?? ''),
       status: String(req.query.status ?? ''),
       vendorId: String(req.query.vendor_id ?? ''),
@@ -2494,19 +2488,19 @@ export function createApiRouter(): express.Router {
     res.send(csv);
   });
 
-  router.get('/vendors/:vendorId/export', requireAuth, (req, res) => {
+  router.get('/vendors/:vendorId/export', requireAuth, async (req, res) => {
     const db = getDb();
-    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
+    const vendor = await db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
     if (!vendor) {
       sendError(req, res, 404, 'NOT_FOUND', 'Vendor not found.');
       return;
     }
 
-    const summary = buildVendorReportRows(db, { vendorId: vendor.id })[0];
-    const purchaseOrders = db
+    const summary = (await buildVendorReportRows(db, { vendorId: vendor.id }))[0];
+    const purchaseOrders = await db
       .prepare('SELECT * FROM purchase_orders WHERE vendor_id = ? ORDER BY issued_date DESC')
       .all(vendor.id) as any[];
-    const invoices = db
+    const invoices = await db
       .prepare(
         `SELECT i.id, i.invoice_number, i.original_filename, i.invoice_date, i.currency, i.total_amount,
                 i.overall_confidence, i.processing_status, i.business_decision, i.review_status,
@@ -2607,17 +2601,17 @@ export function createApiRouter(): express.Router {
     res.send(csv);
   });
 
-  router.get('/vendors/:vendorId', requireAuth, (req, res) => {
+  router.get('/vendors/:vendorId', requireAuth, async (req, res) => {
     const db = getDb();
-    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
+    const vendor = await db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
     if (!vendor) {
       sendError(req, res, 404, 'NOT_FOUND', 'Vendor not found.');
       return;
     }
-    const purchaseOrders = db
+    const purchaseOrders = await db
       .prepare('SELECT * FROM purchase_orders WHERE vendor_id = ? ORDER BY issued_date DESC')
       .all(vendor.id);
-    const invoices = db
+    const invoices = await db
       .prepare(
         `SELECT id, invoice_number, original_filename, total_amount, currency, business_decision, review_status, created_at
          FROM invoices WHERE vendor_id = ? ORDER BY created_at DESC`
@@ -2630,7 +2624,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/vendors', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.post('/vendors', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const { canonical_name, aliases, tax_id, default_currency, verification_status, payment_terms_days } = req.body ?? {};
     const trimmedName = typeof canonical_name === 'string' ? canonical_name.trim() : '';
     if (!trimmedName) {
@@ -2657,7 +2651,7 @@ export function createApiRouter(): express.Router {
     }
 
     const db = getDb();
-    const existingCodes = db.prepare('SELECT vendor_code FROM vendors').all() as Array<{ vendor_code: string }>;
+    const existingCodes = await db.prepare('SELECT vendor_code FROM vendors').all() as Array<{ vendor_code: string }>;
     let maxNum = 0;
     const usedCodes = new Set<string>();
     for (const row of existingCodes) {
@@ -2677,7 +2671,7 @@ export function createApiRouter(): express.Router {
     const aliasArr = Array.isArray(aliases) ? aliases.map((a) => String(a).trim()).filter(Boolean) : [];
     const normName = normalizeVendorName(trimmedName) || trimmedName.toLowerCase();
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO vendors (id, vendor_code, canonical_name, normalized_name, aliases, tax_id, default_currency, verification_status, payment_terms_days, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
@@ -2694,7 +2688,7 @@ export function createApiRouter(): express.Router {
       now
     );
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -2707,9 +2701,9 @@ export function createApiRouter(): express.Router {
     res.status(201).json({ id, vendor_code: vendorCode });
   });
 
-  router.patch('/vendors/:vendorId', requireAuth, requireRoles('ADMIN', 'REVIEWER'), (req, res) => {
+  router.patch('/vendors/:vendorId', requireAuth, requireRoles('ADMIN', 'REVIEWER'), async (req, res) => {
     const db = getDb();
-    const existing = db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
+    const existing = await db.prepare('SELECT * FROM vendors WHERE id = ?').get(req.params.vendorId) as any;
     if (!existing) {
       sendError(req, res, 404, 'NOT_FOUND', 'Vendor not found.');
       return;
@@ -2744,7 +2738,7 @@ export function createApiRouter(): express.Router {
     const nextTax = tax_id !== undefined ? (tax_id ? String(tax_id).trim() : null) : existing.tax_id;
     const now = isoNow();
 
-    db.prepare(
+    await db.prepare(
       `UPDATE vendors SET canonical_name = ?, normalized_name = ?, aliases = ?, tax_id = ?, verification_status = ?, updated_at = ? WHERE id = ?`
     ).run(
       nextName,
@@ -2756,7 +2750,7 @@ export function createApiRouter(): express.Router {
       existing.id
     );
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -2773,13 +2767,13 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== PURCHASE ORDERS ====================
-  router.get('/purchase-orders', requireAuth, (req, res) => {
+  router.get('/purchase-orders', requireAuth, async (req, res) => {
     const db = getDb();
     const q = String(req.query.q ?? '').trim().toLowerCase();
     const status = String(req.query.status ?? '').trim();
     const sort = String(req.query.sort ?? 'issued_desc');
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT po.*, v.canonical_name AS vendor_name, v.vendor_code,
                 (SELECT COUNT(*) FROM invoices i WHERE i.purchase_order_id = po.id) AS linked_invoice_count
@@ -2813,9 +2807,9 @@ export function createApiRouter(): express.Router {
     res.json({ items: mapped, total: mapped.length });
   });
 
-  router.get('/purchase-orders/:poId', requireAuth, (req, res) => {
+  router.get('/purchase-orders/:poId', requireAuth, async (req, res) => {
     const db = getDb();
-    const po = db
+    const po = await db
       .prepare(
         `SELECT po.*, v.canonical_name AS vendor_name, v.vendor_code
          FROM purchase_orders po JOIN vendors v ON v.id = po.vendor_id
@@ -2828,10 +2822,10 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const lines = db
+    const lines = await db
       .prepare('SELECT * FROM purchase_order_lines WHERE purchase_order_id = ? ORDER BY line_number ASC')
       .all(po.id);
-    const invoices = db
+    const invoices = await db
       .prepare(
         `SELECT id, invoice_number, original_filename, total_amount, currency, po_consumed_applied, processing_status, business_decision, review_status, created_at
          FROM invoices WHERE purchase_order_id = ? ORDER BY created_at DESC`
@@ -2851,7 +2845,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post('/purchase-orders', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.post('/purchase-orders', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const { po_number, vendor_id, currency, original_amount, issued_date, notes, lines } = req.body ?? {};
     const poNumStr = typeof po_number === 'string' ? po_number.trim() : '';
     const vendorIdStr = typeof vendor_id === 'string' ? vendor_id.trim() : '';
@@ -2871,7 +2865,7 @@ export function createApiRouter(): express.Router {
     }
 
     const db = getDb();
-    const vendorExists = db.prepare('SELECT id FROM vendors WHERE id = ?').get(vendorIdStr);
+    const vendorExists = await db.prepare('SELECT id FROM vendors WHERE id = ?').get(vendorIdStr);
     if (!vendorExists) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'Referenced vendor_id does not exist.');
       return;
@@ -2899,8 +2893,8 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      withTransaction(db, () => {
-        db.prepare(
+      await withTransaction(db, async () => {
+        await db.prepare(
           `INSERT INTO purchase_orders (id, po_number, normalized_po_number, vendor_id, currency, original_amount, consumed_amount, status, issued_date, notes, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, '0.0000', 'OPEN', ?, ?, ?, ?)`
         ).run(
@@ -2916,8 +2910,8 @@ export function createApiRouter(): express.Router {
           now
         );
 
-        parsedLines.forEach((l, idx) => {
-          db.prepare(
+        for (const [idx, l] of parsedLines.entries()) {
+          await db.prepare(
             `INSERT INTO purchase_order_lines (id, purchase_order_id, line_number, description, quantity, unit_price, line_total)
              VALUES (?, ?, ?, ?, ?, ?, ?)`
           ).run(
@@ -2929,9 +2923,9 @@ export function createApiRouter(): express.Router {
             l.unit.toFixed(4),
             l.qty.mul(l.unit).toFixed(4)
           );
-        });
+        }
 
-        writeAuditLog({
+        await writeAuditLog({
           actorId: req.user!.id,
           actorType: 'USER',
           actorRole: req.user!.role,
@@ -2952,9 +2946,9 @@ export function createApiRouter(): express.Router {
     res.status(201).json({ id, po_number: poNumStr });
   });
 
-  router.patch('/purchase-orders/:poId', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.patch('/purchase-orders/:poId', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const db = getDb();
-    const po = db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(req.params.poId) as any;
+    const po = await db.prepare('SELECT * FROM purchase_orders WHERE id = ?').get(req.params.poId) as any;
     if (!po) {
       sendError(req, res, 404, 'NOT_FOUND', 'Purchase order not found.');
       return;
@@ -2992,7 +2986,7 @@ export function createApiRouter(): express.Router {
     }
 
     const now = isoNow();
-    db.prepare('UPDATE purchase_orders SET original_amount = ?, status = ?, notes = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE purchase_orders SET original_amount = ?, status = ?, notes = ?, updated_at = ? WHERE id = ?').run(
       nextOrig.toFixed(4),
       nextStatus,
       notes !== undefined ? notes : po.notes,
@@ -3000,7 +2994,7 @@ export function createApiRouter(): express.Router {
       po.id
     );
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -3015,14 +3009,14 @@ export function createApiRouter(): express.Router {
 
   // ==================== ANALYTICS & OVERVIEW ====================
 
-  router.get('/analytics/overview', requireAuth, (req, res) => {
+  router.get('/analytics/overview', requireAuth, async (req, res) => {
     const db = getDb();
     const win = String(req.query.window ?? '30d');
     const startIso = windowStartIso(win);
     const whereClause = startIso ? 'WHERE created_at >= ?' : '';
     const params = startIso ? [startIso] : [];
 
-    const invoices = db
+    const invoices = await db
       .prepare(`SELECT id, total_amount, processing_status, business_decision, review_status, created_at FROM invoices ${whereClause}`)
       .all(...params) as any[];
 
@@ -3065,13 +3059,13 @@ export function createApiRouter(): express.Router {
       }
     }
 
-    const recentActivity = db
+    const recentActivity = (await db
       .prepare(
         `SELECT a.*, u.full_name AS actor_name
          FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
          ORDER BY a.id DESC LIMIT 8`
       )
-      .all()
+      .all())
       .map((a: any) => ({ ...a, details: safeJsonParse<Record<string, unknown>>(a.details_json, {}) }));
 
     res.json({
@@ -3096,7 +3090,7 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.get('/analytics/metrics', requireAuth, (req, res) => {
+  router.get('/analytics/metrics', requireAuth, async (req, res) => {
     const db = getDb();
     const win = String(req.query.window ?? '30d');
     const vendorId = String(req.query.vendor_id ?? '');
@@ -3113,7 +3107,7 @@ export function createApiRouter(): express.Router {
       params.push(vendorId);
     }
 
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT i.id, i.overall_confidence, i.business_decision, i.review_status, d.primary_reason_code,
                 r.duration_ms, r.extraction_mode
@@ -3151,7 +3145,7 @@ export function createApiRouter(): express.Router {
       { bucket: '90–100%', count: confs.filter((c) => c >= 0.9).length },
     ];
 
-    const pos = db
+    const pos = await db
       .prepare("SELECT po_number, original_amount, consumed_amount FROM purchase_orders WHERE status != 'CANCELLED'")
       .all() as any[];
     let poOrigTotal = new Decimal(0);
@@ -3193,7 +3187,7 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== GLOBAL SEARCH & NOTIFICATIONS ====================
-  router.get('/search', requireAuth, (req, res) => {
+  router.get('/search', requireAuth, async (req, res) => {
     const db = getDb();
     const q = String(req.query.q ?? '').trim().slice(0, 120).toLowerCase();
     if (!q) {
@@ -3201,7 +3195,7 @@ export function createApiRouter(): express.Router {
       return;
     }
     const like = `%${q}%`;
-    const invoices = db
+    const invoices = await db
       .prepare(
         `SELECT id, invoice_number, original_filename, total_amount, currency, business_decision
          FROM invoices
@@ -3209,7 +3203,7 @@ export function createApiRouter(): express.Router {
          ORDER BY created_at DESC LIMIT 5`
       )
       .all(like, like, like);
-    const purchase_orders = db
+    const purchase_orders = await db
       .prepare(
         `SELECT po.id, po.po_number, po.original_amount, po.consumed_amount, po.status, v.canonical_name AS vendor_name
          FROM purchase_orders po JOIN vendors v ON v.id = po.vendor_id
@@ -3217,7 +3211,7 @@ export function createApiRouter(): express.Router {
          LIMIT 5`
       )
       .all(like, like);
-    const vendors = db
+    const vendors = await db
       .prepare(
         `SELECT id, vendor_code, canonical_name, verification_status
          FROM vendors
@@ -3229,15 +3223,15 @@ export function createApiRouter(): express.Router {
     res.json({ invoices, purchase_orders, vendors });
   });
 
-  router.get('/notifications', requireAuth, (req, res) => {
+  router.get('/notifications', requireAuth, async (req, res) => {
     const type = String(req.query.type ?? 'ALL');
     const unreadOnly = req.query.unread_only === 'true';
     const limit = parsePositiveInt(req.query.limit, 30, 100);
-    const data = listNotificationsForUser(req.user!.id, { type, unreadOnly, limit });
+    const data = await listNotificationsForUser(req.user!.id, { type, unreadOnly, limit });
     res.json(data);
   });
 
-  router.get('/notifications/stream', requireAuth, (req, res) => {
+  router.get('/notifications/stream', requireAuth, async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
@@ -3249,7 +3243,7 @@ export function createApiRouter(): express.Router {
     let lastSentId = Number.parseInt(lastEventIdHeader, 10) || 0;
 
     if (lastSentId > 0) {
-      const missed = listMissedNotificationsSince(lastSentId);
+      const missed = await listMissedNotificationsSince(lastSentId);
       for (const item of missed) {
         lastSentId = Math.max(lastSentId, item.id);
         safeSseWrite(res, `id: ${item.id}\nevent: notification_created\ndata: ${JSON.stringify(item)}\n\n`);
@@ -3288,25 +3282,25 @@ export function createApiRouter(): express.Router {
     req.on('close', cleanup);
   });
 
-  router.post('/notifications/:notificationId/read', requireAuth, (req, res) => {
+  router.post('/notifications/:notificationId/read', requireAuth, async (req, res) => {
     const id = Number(req.params.notificationId);
     if (!Number.isFinite(id) || id <= 0) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'Invalid notification ID.');
       return;
     }
-    markNotificationRead(req.user!.id, id);
+    await markNotificationRead(req.user!.id, id);
     res.json({ ok: true, id });
   });
 
-  router.post('/notifications/read-all', requireAuth, (req, res) => {
-    const marked = markAllNotificationsRead(req.user!.id);
+  router.post('/notifications/read-all', requireAuth, async (req, res) => {
+    const marked = await markAllNotificationsRead(req.user!.id);
     res.json({ ok: true, marked_count: marked });
   });
 
   // ==================== AUDIT TRAIL ====================
-  function queryFilteredAuditLogs(params: { q: string; action: string; resourceType: string }) {
+  async function queryFilteredAuditLogs(params: { q: string; action: string; resourceType: string }) {
     const db = getDb();
-    const rows = db
+    const rows = await db
       .prepare(
         `SELECT a.*,
                 u.email AS actor_email,
@@ -3423,23 +3417,23 @@ export function createApiRouter(): express.Router {
       });
   }
 
-  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), (req, res) => {
+  router.get('/audit-logs', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), async (req, res) => {
     const q = String(req.query.q ?? '');
     const action = String(req.query.action ?? '');
     const resourceType = String(req.query.resource_type ?? '');
     const page = parsePositiveInt(req.query.page, 1, 10_000);
     const pageSize = parsePositiveInt(req.query.page_size, 30, 100);
 
-    const filtered = queryFilteredAuditLogs({ q, action, resourceType });
+    const filtered = await queryFilteredAuditLogs({ q, action, resourceType });
     const paged = filtered.slice((page - 1) * pageSize, page * pageSize);
     res.json({ items: paged, total: filtered.length, page, page_size: pageSize });
   });
 
-  router.get('/audit-logs/export', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), (req, res) => {
+  router.get('/audit-logs/export', requireAuth, requireRoles('REVIEWER', 'AUDITOR', 'ADMIN'), async (req, res) => {
     const q = String(req.query.q ?? '');
     const action = String(req.query.action ?? '');
     const resourceType = String(req.query.resource_type ?? '');
-    const rows = queryFilteredAuditLogs({ q, action, resourceType });
+    const rows = await queryFilteredAuditLogs({ q, action, resourceType });
     const headers = [
       'id',
       'created_at',
@@ -3469,9 +3463,9 @@ export function createApiRouter(): express.Router {
   });
 
   // ==================== SETTINGS & USERS ====================
-  router.get('/settings', requireAuth, (_req, res) => {
+  router.get('/settings', requireAuth, async (_req, res) => {
     const db = getDb();
-    const settings = db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
+    const settings = await db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
     res.json({
       ...settings,
       active_extraction_provider: `Gemini Flash (${config.geminiModel})`,
@@ -3479,9 +3473,9 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.patch('/settings', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.patch('/settings', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const db = getDb();
-    const before = db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
+    const before = await db.prepare('SELECT * FROM application_settings WHERE id = 1').get() as any;
     const body = req.body ?? {};
 
     const tolPct =
@@ -3593,7 +3587,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    db.prepare(
+    await db.prepare(
       `UPDATE application_settings SET
         workspace_name = ?,
         default_currency = ?,
@@ -3635,7 +3629,7 @@ export function createApiRouter(): express.Router {
       now
     );
 
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -3669,14 +3663,14 @@ export function createApiRouter(): express.Router {
     res.json({ ok: true });
   });
 
-  router.patch('/users/me/preferences', requireAuth, (req, res) => {
+  router.patch('/users/me/preferences', requireAuth, async (req, res) => {
     const theme = String(req.body?.theme_preference ?? '');
     if (!['light', 'dark', 'system'].includes(theme)) {
       sendError(req, res, 422, 'VALIDATION_ERROR', 'theme_preference must be light, dark, or system.');
       return;
     }
     const db = getDb();
-    db.prepare('UPDATE users SET theme_preference = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE users SET theme_preference = ?, updated_at = ? WHERE id = ?').run(
       theme,
       isoNow(),
       req.user!.id
@@ -3684,15 +3678,15 @@ export function createApiRouter(): express.Router {
     res.json({ ok: true, theme_preference: theme });
   });
 
-  router.get('/users', requireAuth, requireRoles('ADMIN'), (_req, res) => {
+  router.get('/users', requireAuth, requireRoles('ADMIN'), async (_req, res) => {
     const db = getDb();
-    const users = db
+    const users = await db
       .prepare('SELECT id, email, full_name, role, is_active, created_at FROM users ORDER BY created_at ASC')
       .all();
     res.json({ items: users });
   });
 
-  router.post('/users', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.post('/users', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const { email, full_name, role, password } = req.body ?? {};
     const emailStr = typeof email === 'string' ? email.trim().toLowerCase() : '';
     const fullNameStr = typeof full_name === 'string' ? full_name.trim() : '';
@@ -3715,7 +3709,7 @@ export function createApiRouter(): express.Router {
     const id = crypto.randomUUID();
     const now = isoNow();
     try {
-      db.prepare(
+      await db.prepare(
         `INSERT INTO users (id, email, full_name, password_hash, role, theme_preference, is_active, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 'light', 1, ?, ?)`
       ).run(
@@ -3734,7 +3728,7 @@ export function createApiRouter(): express.Router {
       }
       throw err;
     }
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
@@ -3746,9 +3740,9 @@ export function createApiRouter(): express.Router {
     res.status(201).json({ id, email: emailStr, role: roleStr });
   });
 
-  router.patch('/users/:userId', requireAuth, requireRoles('ADMIN'), (req, res) => {
+  router.patch('/users/:userId', requireAuth, requireRoles('ADMIN'), async (req, res) => {
     const db = getDb();
-    const existing = db.prepare('SELECT id, email, role, is_active FROM users WHERE id = ?').get(req.params.userId) as any;
+    const existing = await db.prepare('SELECT id, email, role, is_active FROM users WHERE id = ?').get(req.params.userId) as any;
     if (!existing) {
       sendError(req, res, 404, 'NOT_FOUND', 'User not found.');
       return;
@@ -3772,7 +3766,7 @@ export function createApiRouter(): express.Router {
     }
 
     if (existing.role === 'ADMIN' && existing.is_active === 1 && (nextRole !== 'ADMIN' || !nextActive)) {
-      const remainingAdmins = db
+      const remainingAdmins = await db
         .prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'ADMIN' AND is_active = 1 AND id != ?")
         .get(existing.id) as { cnt: number };
       if ((remainingAdmins?.cnt ?? 0) === 0) {
@@ -3787,13 +3781,13 @@ export function createApiRouter(): express.Router {
       }
     }
 
-    db.prepare('UPDATE users SET role = ?, is_active = ?, updated_at = ? WHERE id = ?').run(
+    await db.prepare('UPDATE users SET role = ?, is_active = ?, updated_at = ? WHERE id = ?').run(
       nextRole,
       nextActive,
       isoNow(),
       existing.id
     );
-    writeAuditLog({
+    await writeAuditLog({
       actorId: req.user!.id,
       actorType: 'USER',
       actorRole: req.user!.role,
