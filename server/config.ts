@@ -56,7 +56,14 @@ export const config = {
   signedOutCookieName: 'invoicedesk_signed_out',
   dataDir: DATA_DIR,
   databaseUrl,
-  databaseAuthToken: (process.env.TURSO_AUTH_TOKEN || process.env.DATABASE_AUTH_TOKEN || '').trim(),
+  // The Vercel Marketplace Turso integration prefixes its variables (e.g. TURSO_DATABASE_TURSO_AUTH_TOKEN).
+  databaseAuthToken: (
+    process.env.TURSO_AUTH_TOKEN ||
+    process.env.DATABASE_AUTH_TOKEN ||
+    process.env.TURSO_DATABASE_TURSO_AUTH_TOKEN ||
+    Object.entries(process.env).find(([k, v]) => k.endsWith('TURSO_AUTH_TOKEN') && v)?.[1] ||
+    ''
+  ).trim(),
   usesSharedDatabase,
   storageDir: STORAGE_DIR,
   fixturesDir: FIXTURES_DIR,
