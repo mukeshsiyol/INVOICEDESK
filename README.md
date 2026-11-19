@@ -17,7 +17,7 @@ InvoiceDesk transforms unstructured vendor invoice PDFs (both native text and sc
    ```env
    GEMINI_API_KEY="your-google-ai-studio-api-key"
    # Optional model override for exported deployments:
-   # GEMINI_MODEL="gemini-4-hydrogen"
+   # GEMINI_MODEL="gemini-4-argon"
    JWT_SECRET="replace-with-a-32-character-random-secret"
    APP_ENV="demo"
    ENABLE_DEMO_ROLE_SWITCHER="true"

@@ -46,7 +46,7 @@ export const config = {
         pauseAuthForDemo,
   pauseAuthForDemo,
   geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '',
-  geminiModel: process.env.GEMINI_MODEL || 'gemini-4-hydrogen',
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-4-argon',
   geminiFallbackModel: 'gemini-3.1-flash-lite',
   jwtSecret:
     process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 16
