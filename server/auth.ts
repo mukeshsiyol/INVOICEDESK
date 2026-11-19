@@ -82,15 +82,15 @@ export function clearSessionCookie(res: Response, markSignedOut = false, req?: R
   }
 }
 
-function getDemoUserByRole(role: UserRole = 'ADMIN'): AuthUser | null {
+async function getDemoUserByRole(role: UserRole = 'ADMIN'): Promise<AuthUser | null> {
   const db = getDb();
-  const row = db
+  const row = await db
     .prepare(
       'SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE role = ? AND is_active = 1 ORDER BY created_at ASC LIMIT 1'
     )
     .get(role) as AuthUser | undefined;
   if (row) return row;
-  const fallback = db
+  const fallback = await db
     .prepare(
       'SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE is_active = 1 ORDER BY created_at ASC LIMIT 1'
     )
@@ -98,7 +98,7 @@ function getDemoUserByRole(role: UserRole = 'ADMIN'): AuthUser | null {
   return fallback ?? null;
 }
 
-export function getUserFromRequest(req: Request): AuthUser | null {
+export async function getUserFromRequest(req: Request): Promise<AuthUser | null> {
   const isExplicitlySignedOut =
     !config.pauseAuthForDemo && req.cookies?.[config.signedOutCookieName] === '1';
 
@@ -108,7 +108,7 @@ export function getUserFromRequest(req: Request): AuthUser | null {
     ).trim();
     if (headerUserId) {
       const db = getDb();
-      const targetUser = db
+      const targetUser = await db
         .prepare(
           'SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE id = ? AND is_active = 1'
         )
@@ -120,7 +120,7 @@ export function getUserFromRequest(req: Request): AuthUser | null {
       req.header('X-Demo-Role') ?? req.query?.demo_role ?? ''
     ).toUpperCase() as UserRole;
     if (['OPERATOR', 'REVIEWER', 'AUDITOR', 'ADMIN'].includes(headerRole)) {
-      const demoUser = getDemoUserByRole(headerRole);
+      const demoUser = await getDemoUserByRole(headerRole);
       if (demoUser) return demoUser;
     }
   }
@@ -130,7 +130,7 @@ export function getUserFromRequest(req: Request): AuthUser | null {
     try {
       const decoded = jwt.verify(token, config.jwtSecret) as { sub: string };
       const db = getDb();
-      const row = db
+      const row = await db
         .prepare(
           'SELECT id, email, full_name, role, theme_preference, is_active FROM users WHERE id = ? AND is_active = 1'
         )
@@ -148,8 +148,8 @@ export function getUserFromRequest(req: Request): AuthUser | null {
   return null;
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const user = getUserFromRequest(req);
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const user = await getUserFromRequest(req);
   if (!user) {
     res.status(401).json({
       error: {
@@ -193,7 +193,7 @@ export function requireRoles(...roles: UserRole[]) {
   };
 }
 
-export function writeAuditLog(params: {
+export async function writeAuditLog(params: {
   actorId: string | null;
   actorType: 'USER' | 'SYSTEM';
   actorRole: string;
@@ -203,9 +203,9 @@ export function writeAuditLog(params: {
   originalDecision?: string | null;
   newDecision?: string | null;
   details?: Record<string, unknown>;
-}): void {
+}): Promise<void> {
   const db = getDb();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO audit_logs (actor_id, actor_type, actor_role, action, resource_type, resource_id, original_decision, new_decision, details_json, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(

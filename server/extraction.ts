@@ -4,6 +4,7 @@ import path from 'node:path';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { z } from 'zod';
 import { config } from './config.ts';
+import { getDb } from './db.ts';
 
 export const ExtractedLineItemSchema = z.object({
   line_number: z.number().int().positive(),
@@ -179,19 +180,32 @@ export async function inspectPdfNativeText(
   }
 }
 
+/**
+ * PDFs are stored in the `documents` table so every serverless instance can read
+ * them (a file in one instance's /tmp is invisible to the others).
+ */
 export async function persistValidatedPdf(params: {
   invoiceId: string;
   fileSha256: string;
   buffer: Buffer;
 }): Promise<string> {
-  const folder = path.join(config.storageDir, params.invoiceId);
-  await fs.mkdir(folder, { recursive: true });
-  const targetPath = path.join(folder, `${params.fileSha256}.pdf`);
-  await fs.writeFile(targetPath, params.buffer);
-  return path.relative(config.dataDir, targetPath);
+  const storageKey = `storage/invoices/${params.invoiceId}/${params.fileSha256}.pdf`;
+  await getDb()
+    .prepare(
+      `INSERT INTO documents (storage_key, content, size_bytes, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(storage_key) DO UPDATE SET content = excluded.content, size_bytes = excluded.size_bytes`
+    )
+    .run(storageKey, params.buffer, params.buffer.length, new Date().toISOString());
+  return storageKey;
 }
 
 export async function readStoredPdf(storageKey: string): Promise<Buffer> {
+  const row = (await getDb()
+    .prepare('SELECT content FROM documents WHERE storage_key = ?')
+    .get(storageKey)) as { content: Buffer } | undefined;
+  if (row?.content) return Buffer.from(row.content);
+
+  // Legacy fallback: PDFs written to the local data folder before the documents table existed.
   const resolved = path.resolve(config.dataDir, storageKey);
   if (!resolved.startsWith(path.resolve(config.dataDir))) {
     throw new Error('Invalid storage path traversal attempt.');

@@ -57,7 +57,8 @@ The included `Dockerfile` builds the Vite SPA and runs the Express + SQLite serv
 Preconfigured with `vercel.json`, `api/index.ts`, and `"engines": { "node": "22.x" }`:
 - Deploy directly via **Vercel Dashboard** (import repo) or **Vercel CLI** (`npx vercel --prod`).
 - Add `GEMINI_API_KEY` in Vercel **Project Settings → Environment Variables**.
-- **Serverless behavior note:** When `VERCEL=1` is detected, SQLite and uploaded PDFs store automatically in `/tmp/invoicedesk-data` and pipeline execution completes inline per request (`maxDuration: 60`s). Because `/tmp` is ephemeral across serverless cold starts, use **Option A** (Cloud Run / Railway / Render / Docker) for durable database persistence across restarts.
+- **Database (required):** serverless instances don't share a disk, so set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` (a free [Turso](https://turso.tech) database) in **Environment Variables**. The schema and demo data are created automatically on first request. Uploaded PDFs are stored in the same database (`documents` table), so no separate file storage is needed. Without these variables each instance falls back to its own `/tmp` copy and uploads appear to vanish ("Unable to load invoice workspace").
+- Pipeline execution completes inline per request (`maxDuration: 60`s). Vercel caps request bodies at 4.5 MB, so larger PDFs can't be uploaded there.
 
 ## OpenAPI 3.1 Specification
 

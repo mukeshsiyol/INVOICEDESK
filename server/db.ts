@@ -1,47 +1,209 @@
-import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { Client, InValue, ResultSet, Transaction } from '@libsql/client';
 import { config } from './config.ts';
 import {
   DEFAULT_REJECTION_BODY_TEMPLATE,
   DEFAULT_REJECTION_SUBJECT_TEMPLATE,
 } from '../src/lib/rejectionTemplate.ts';
 
-let dbInstance: DatabaseSync | null = null;
+/**
+ * Async SQLite access through libSQL.
+ *
+ * - Locally (no TURSO_DATABASE_URL) this is a plain SQLite file under ./data.
+ * - On Vercel/serverless it MUST point at a shared Turso database, because every
+ *   function instance has its own private /tmp — data written by one instance is
+ *   invisible to the next, which is what caused "Unable to load invoice workspace".
+ *
+ * The API mirrors node:sqlite (prepare().get/all/run, exec) but every call returns
+ * a Promise. Transactions go through db.transaction(fn); statements issued inside
+ * fn (including from helper functions that call getDb()) automatically join it.
+ */
 
-export function safeRollback(db: DatabaseSync): void {
-  try {
-    const inTx = (db as unknown as { isTransaction?: boolean }).isTransaction;
-    if (inTx === false) return;
-    db.exec('ROLLBACK;');
-  } catch {
-    // SQLite may have already rolled back automatically on constraint/busy errors
+type Params = unknown[];
+export type RunResult = { changes: number; lastInsertRowid: number | bigint | undefined };
+
+const txStorage = new AsyncLocalStorage<Transaction>();
+// In-process lock so a transaction never interleaves with other statements from this
+// instance (matches the old synchronous semantics and avoids SQLITE_BUSY locally).
+let txQueue: Promise<void> = Promise.resolve();
+let txActive: Promise<void> | null = null;
+
+function normalizeValue(value: unknown): unknown {
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  return value;
+}
+
+function rowsToObjects(rs: ResultSet): any[] {
+  const out: any[] = [];
+  for (const row of rs.rows) {
+    const obj: Record<string, unknown> = {};
+    rs.columns.forEach((col, i) => {
+      obj[col] = normalizeValue((row as any)[i]);
+    });
+    out.push(obj);
+  }
+  return out;
+}
+
+function toArgs(params: Params): InValue[] {
+  return params.map((p) => (p === undefined ? null : (p as InValue)));
+}
+
+export class AsyncStatement {
+  constructor(private readonly db: AsyncDatabase, private readonly sql: string) {}
+
+  async all(...params: Params): Promise<any[]> {
+    return rowsToObjects(await this.db.execute(this.sql, params));
+  }
+
+  async get(...params: Params): Promise<any> {
+    const rows = rowsToObjects(await this.db.execute(this.sql, params));
+    return rows[0];
+  }
+
+  async run(...params: Params): Promise<RunResult> {
+    const rs = await this.db.execute(this.sql, params);
+    return { changes: rs.rowsAffected, lastInsertRowid: rs.lastInsertRowid };
   }
 }
 
-export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    const result = fn();
-    db.exec('COMMIT;');
-    return result;
-  } catch (err) {
-    safeRollback(db);
-    throw err;
+export class AsyncDatabase {
+  constructor(private readonly clientPromise: Promise<Client>) {}
+
+  get client(): Promise<Client> {
+    return this.clientPromise;
+  }
+
+  prepare(sql: string): AsyncStatement {
+    return new AsyncStatement(this, sql);
+  }
+
+  /** Runs one or more semicolon-separated statements. */
+  async exec(sql: string): Promise<void> {
+    const tx = txStorage.getStore();
+    if (tx) {
+      await tx.executeMultiple(sql);
+      return;
+    }
+    await this.waitForOtherTransactions();
+    await (await this.clientPromise).executeMultiple(sql);
+  }
+
+  async execute(sql: string, params: Params): Promise<ResultSet> {
+    const tx = txStorage.getStore();
+    if (tx) return tx.execute({ sql, args: toArgs(params) });
+    await this.waitForOtherTransactions();
+    return (await this.clientPromise).execute({ sql, args: toArgs(params) });
+  }
+
+  /** Runs fn inside a write transaction. Nested calls join the outer transaction. */
+  async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (txStorage.getStore()) return fn();
+
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => (release = resolve));
+    const previous = txQueue;
+    txQueue = previous.then(() => mine);
+    await previous;
+    txActive = mine;
+
+    try {
+      const tx = await this.beginWithRetry();
+      try {
+        const result = await txStorage.run(tx, fn);
+        await tx.commit();
+        return result;
+      } catch (err) {
+        try {
+          await tx.rollback();
+        } catch {
+          /* connection may already be closed */
+        }
+        throw err;
+      } finally {
+        tx.close();
+      }
+    } finally {
+      txActive = null;
+      release();
+    }
+  }
+
+  private async beginWithRetry(): Promise<Transaction> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        return await (await this.clientPromise).transaction('write');
+      } catch (err) {
+        lastErr = err;
+        if (!/SQLITE_BUSY|database is locked/i.test(String((err as Error)?.message))) throw err;
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  }
+
+  private async waitForOtherTransactions(): Promise<void> {
+    while (txActive) await txActive;
   }
 }
 
-export function getDb(): DatabaseSync {
+let dbInstance: AsyncDatabase | null = null;
+let schemaPromise: Promise<void> | null = null;
+
+async function openClient(): Promise<Client> {
+  if (config.databaseUrl.startsWith('file:')) {
+    // Local SQLite file (native driver). Only used for local dev / Docker.
+    const { createClient } = await import('@libsql/client');
+    return createClient({
+      url: config.databaseUrl,
+      // Busy timeout (ms); applies to every pooled connection.
+      timeout: 5000,
+    });
+  }
+  // Remote Turso database over HTTP — pure JS, no native binary needed on Vercel.
+  const { createClient } = await import('@libsql/client/web');
+  return createClient({
+    url: config.databaseUrl,
+    authToken: config.databaseAuthToken || undefined,
+  });
+}
+
+export function getDb(): AsyncDatabase {
   if (!dbInstance) {
-    dbInstance = new DatabaseSync(config.dbPath);
-    dbInstance.exec('PRAGMA journal_mode = WAL;');
-    dbInstance.exec('PRAGMA foreign_keys = ON;');
-    dbInstance.exec('PRAGMA busy_timeout = 5000;');
-    initSchema(dbInstance);
+    const clientPromise = openClient();
+    clientPromise.catch(() => {
+      dbInstance = null; // allow a later call to retry
+    });
+    dbInstance = new AsyncDatabase(clientPromise);
   }
   return dbInstance;
 }
 
-function initSchema(db: DatabaseSync): void {
-  db.exec(`
+/** Kept for call-site compatibility; nested calls join the outer transaction. */
+export async function withTransaction<T>(db: AsyncDatabase, fn: () => Promise<T> | T): Promise<T> {
+  return db.transaction(async () => fn());
+}
+
+/** Creates/migrates the schema once per process. Call before handling requests. */
+export function ensureSchema(): Promise<void> {
+  if (!schemaPromise) {
+    schemaPromise = (async () => {
+      const db = getDb();
+      if (config.databaseUrl.startsWith('file:')) {
+        await db.exec('PRAGMA journal_mode = WAL;');
+      }
+      await initSchema(db);
+    })().catch((err) => {
+      schemaPromise = null;
+      throw err;
+    });
+  }
+  return schemaPromise;
+}
+
+async function initSchema(db: AsyncDatabase): Promise<void> {
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       email TEXT NOT NULL UNIQUE,
@@ -271,6 +433,13 @@ function initSchema(db: DatabaseSync): void {
     CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(id DESC);
     CREATE INDEX IF NOT EXISTS idx_notifications_invoice ON notifications(invoice_id, id DESC);
 
+    CREATE TABLE IF NOT EXISTS documents (
+      storage_key TEXT PRIMARY KEY,
+      content BLOB NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS notification_reads (
       notification_id INTEGER NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -280,14 +449,14 @@ function initSchema(db: DatabaseSync): void {
   `);
 
   // Safe migration for existing SQLite databases
-  const usersTableMeta = db
+  const usersTableMeta = await db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
     .get() as { sql?: string } | undefined;
   if (usersTableMeta?.sql && !usersTableMeta.sql.includes("'AUDITOR'")) {
-    db.exec('PRAGMA foreign_keys = OFF;');
+    await db.exec('PRAGMA foreign_keys = OFF;');
     try {
-      withTransaction(db, () => {
-        db.exec(`
+      withTransaction(db, async () => {
+        await db.exec(`
           CREATE TABLE users_new (
             id TEXT PRIMARY KEY,
             email TEXT NOT NULL UNIQUE,
@@ -306,28 +475,28 @@ function initSchema(db: DatabaseSync): void {
         `);
       });
     } finally {
-      db.exec('PRAGMA foreign_keys = ON;');
+      await db.exec('PRAGMA foreign_keys = ON;');
     }
   }
 
-  const cols = db.prepare('PRAGMA table_info(application_settings)').all() as Array<{ name: string }>;
+  const cols = await db.prepare('PRAGMA table_info(application_settings)').all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === 'notify_on_upload')) {
-    db.exec('ALTER TABLE application_settings ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 1;');
+    await db.exec('ALTER TABLE application_settings ADD COLUMN notify_on_upload INTEGER NOT NULL DEFAULT 1;');
   }
   if (!cols.some((c) => c.name === 'rejection_email_subject_template')) {
-    db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_subject_template TEXT NOT NULL DEFAULT '';");
+    await db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_subject_template TEXT NOT NULL DEFAULT '';");
   }
   if (!cols.some((c) => c.name === 'rejection_email_body_template')) {
-    db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_body_template TEXT NOT NULL DEFAULT '';");
+    await db.exec("ALTER TABLE application_settings ADD COLUMN rejection_email_body_template TEXT NOT NULL DEFAULT '';");
   }
   if (!cols.some((c) => c.name === 'reviewer_approval_limit')) {
-    db.exec("ALTER TABLE application_settings ADD COLUMN reviewer_approval_limit TEXT DEFAULT '10000.0000';");
+    await db.exec("ALTER TABLE application_settings ADD COLUMN reviewer_approval_limit TEXT DEFAULT '10000.0000';");
   }
   if (!cols.some((c) => c.name === 'enforce_separation_of_duties')) {
-    db.exec('ALTER TABLE application_settings ADD COLUMN enforce_separation_of_duties INTEGER NOT NULL DEFAULT 1;');
+    await db.exec('ALTER TABLE application_settings ADD COLUMN enforce_separation_of_duties INTEGER NOT NULL DEFAULT 1;');
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE application_settings
      SET rejection_email_subject_template = CASE
            WHEN COALESCE(TRIM(rejection_email_subject_template), '') = '' THEN ?
@@ -342,7 +511,7 @@ function initSchema(db: DatabaseSync): void {
 
   // Additive migration for databases created before explanation provenance existed.
   const decisionColumns = new Set(
-    (db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map((column) => column.name)
+    (await db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map((column) => column.name)
   );
   const explanationColumns: Array<[string, string]> = [
     ['explanation_source', "TEXT NOT NULL DEFAULT 'DETERMINISTIC_FALLBACK'"],
@@ -358,7 +527,7 @@ function initSchema(db: DatabaseSync): void {
   ];
   for (const [column, definition] of explanationColumns) {
     if (!decisionColumns.has(column)) {
-      db.exec(`ALTER TABLE decisions ADD COLUMN ${column} ${definition}`);
+      await db.exec(`ALTER TABLE decisions ADD COLUMN ${column} ${definition}`);
     }
   }
 }

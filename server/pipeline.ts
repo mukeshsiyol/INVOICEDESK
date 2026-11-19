@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import Decimal from 'decimal.js';
 import { writeAuditLog } from './auth.ts';
 import { config } from './config.ts';
-import { getDb, isoNow, safeRollback } from './db.ts';
+import { getDb, isoNow } from './db.ts';
 import {
   normalizeDocNumber,
   parseDecimalSafe,
@@ -65,6 +65,9 @@ async function drainQueue(): Promise<void> {
   activeWorkers++;
   try {
     await next();
+  } catch (err) {
+    // A background run must never take the whole server down.
+    console.error('[invoicedesk] Background processing run crashed:', err);
   } finally {
     activeWorkers--;
     void drainQueue();
@@ -82,18 +85,18 @@ const STAGE_NAMES: Record<number, { code: string; label: string }> = {
   8: { code: 'STAGE_8_DECISION_GENERATION', label: 'Decision Generation & Ledger Update' },
 };
 
-function persistAndEmitStageEvent(params: {
+async function persistAndEmitStageEvent(params: {
   runId: string;
   stageNumber: number;
   status: 'STARTED' | 'COMPLETED' | 'WARNING' | 'FAILED';
   summary: string;
   durationMs?: number | null;
   evidence?: Record<string, unknown>;
-}): number {
+}): Promise<number> {
   const db = getDb();
   const stageMeta = STAGE_NAMES[params.stageNumber];
   const now = isoNow();
-  const result = db
+  const result = await db
     .prepare(
       `INSERT INTO stage_events (run_id, stage_number, stage_code, status, summary, duration_ms, evidence_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -155,7 +158,7 @@ export async function startProcessingRun(runId: string): Promise<void> {
 
 export async function executeProcessingRun(runId: string): Promise<void> {
   const db = getDb();
-  const runRow = db
+  const runRow = await db
     .prepare('SELECT id, invoice_id, run_number, trigger_type, status FROM processing_runs WHERE id = ?')
     .get(runId) as
     | { id: string; invoice_id: string; run_number: number; trigger_type: string; status: string }
@@ -163,7 +166,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
   if (!runRow || runRow.status !== 'QUEUED') return;
 
-  const invoiceRow = db
+  const invoiceRow = await db
     .prepare('SELECT id, original_filename, storage_key, file_sha256, file_size_bytes, po_consumed_applied FROM invoices WHERE id = ?')
     .get(runRow.invoice_id) as
     | {
@@ -178,7 +181,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
   if (!invoiceRow) return;
 
-  const settings = db
+  const settings = await db
     .prepare('SELECT * FROM application_settings WHERE id = 1')
     .get() as unknown as ApplicationSettingsRow;
 
@@ -187,13 +190,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
   let currentStage = 1;
 
   // Atomically claim the QUEUED run so concurrent callers cannot double-execute it
-  const claimed = db
+  const claimed = await db
     .prepare(`UPDATE processing_runs SET status = 'RUNNING', current_stage = 1, started_at = ? WHERE id = ? AND status = 'QUEUED'`)
     .run(startedAt, runId);
   if (claimed.changes === 0) return;
 
   try {
-    db.prepare(`UPDATE invoices SET processing_status = 'RUNNING', updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE invoices SET processing_status = 'RUNNING', updated_at = ? WHERE id = ?`).run(
       startedAt,
       invoiceRow.id
     );
@@ -201,7 +204,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     // ==================== STAGE 1: INGESTION ====================
     currentStage = 1;
     const s1Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 1,
       status: 'STARTED',
@@ -214,13 +217,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       throw new Error(pdfCheck.reason || 'PDF validation failed.');
     }
     const nativeInspection = await inspectPdfNativeText(pdfBuffer, { maxPages: 25, timeoutMs: 8000 });
-    db.prepare(`UPDATE invoices SET page_count = ?, updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE invoices SET page_count = ?, updated_at = ? WHERE id = ?`).run(
       nativeInspection.pageCount,
       isoNow(),
       invoiceRow.id
     );
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 1,
       status: 'COMPLETED',
@@ -236,13 +239,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 2: EXTRACTION ====================
     currentStage = 2;
-    db.prepare(`UPDATE processing_runs SET current_stage = 2 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 2 WHERE id = ?`).run(runId);
     const s2Start = Date.now();
     const minChars = settings.ocr_min_chars_per_page ?? 50;
     const useOcr = Boolean(settings.force_ocr) || nativeInspection.avgCharsPerPage < minChars;
     const extractionMode: 'NATIVE_TEXT' | 'OCR' = useOcr ? 'OCR' : 'NATIVE_TEXT';
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 2,
       status: 'STARTED',
@@ -273,11 +276,11 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     const overallConf = Number((confValues.reduce((a, b) => a + b, 0) / confValues.length).toFixed(4));
     const normInvNo = normalizeDocNumber(extracted.invoice_number);
 
-    db.prepare(
+    await db.prepare(
       `UPDATE processing_runs SET extraction_mode = ?, raw_extracted_json = ? WHERE id = ?`
     ).run(extractionMode, JSON.stringify(extracted), runId);
 
-    db.prepare(
+    await db.prepare(
       `UPDATE invoices SET
         document_type = ?,
         extracted_vendor_name = ?,
@@ -312,13 +315,13 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       invoiceRow.id
     );
 
-    db.prepare('DELETE FROM invoice_lines WHERE run_id = ?').run(runId);
+    await db.prepare('DELETE FROM invoice_lines WHERE run_id = ?').run(runId);
     const insertLine = db.prepare(
       `INSERT INTO invoice_lines (id, invoice_id, run_id, line_number, description, is_bundled, quantity, unit_price, tax_amount, line_total)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const line of extracted.line_items) {
-      insertLine.run(
+      await insertLine.run(
         crypto.randomUUID(),
         invoiceRow.id,
         runId,
@@ -332,7 +335,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       );
     }
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 2,
       status: fallbackUsed ? 'WARNING' : 'COMPLETED',
@@ -359,9 +362,9 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 3: VALIDATION ====================
     currentStage = 3;
-    db.prepare(`UPDATE processing_runs SET current_stage = 3 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 3 WHERE id = ?`).run(runId);
     const s3Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 3,
       status: 'STARTED',
@@ -369,7 +372,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     });
 
     const validation = runStage3Validation(extracted, settings);
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 3,
       status: validation.passed ? 'COMPLETED' : 'WARNING',
@@ -389,25 +392,25 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 4: VENDOR VERIFICATION ====================
     currentStage = 4;
-    db.prepare(`UPDATE processing_runs SET current_stage = 4 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 4 WHERE id = ?`).run(runId);
     const s4Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 4,
       status: 'STARTED',
       summary: `Verifying vendor '${extracted.vendor.name ?? 'Unknown'}' against approved supplier directory...`,
     });
 
-    const vendorResult = runStage4VendorVerification(db, extracted);
+    const vendorResult = await runStage4VendorVerification(db, extracted);
     if (vendorResult.matchedVendorId) {
-      db.prepare('UPDATE invoices SET vendor_id = ?, updated_at = ? WHERE id = ?').run(
+      await db.prepare('UPDATE invoices SET vendor_id = ?, updated_at = ? WHERE id = ?').run(
         vendorResult.matchedVendorId,
         isoNow(),
         invoiceRow.id
       );
     }
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 4,
       status:
@@ -425,16 +428,16 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 5: DUPLICATE DETECTION ====================
     currentStage = 5;
-    db.prepare(`UPDATE processing_runs SET current_stage = 5 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 5 WHERE id = ?`).run(runId);
     const s5Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 5,
       status: 'STARTED',
       summary: 'Checking SHA-256 fingerprint, vendor, normalized invoice number, and invoice date uniqueness...',
     });
 
-    const dupResult = runStage5DuplicateDetection(
+    const dupResult = await runStage5DuplicateDetection(
       db,
       invoiceRow.id,
       invoiceRow.file_sha256,
@@ -442,7 +445,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       extracted
     );
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 5,
       status: dupResult.isExactFileDuplicate || dupResult.isBusinessDuplicate || dupResult.isNearDuplicate ? 'WARNING' : 'COMPLETED',
@@ -457,9 +460,9 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 6: PO MATCHING ====================
     currentStage = 6;
-    db.prepare(`UPDATE processing_runs SET current_stage = 6 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 6 WHERE id = ?`).run(runId);
     const s6Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 6,
       status: 'STARTED',
@@ -468,16 +471,16 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         : 'No explicit PO number; checking open vendor POs for candidates...',
     });
 
-    const poMatch = runStage6PoMatching(db, extracted, vendorResult);
+    const poMatch = await runStage6PoMatching(db, extracted, vendorResult);
     if (poMatch.matchedPoId && poMatch.matchStatus === 'EXACT') {
-      db.prepare('UPDATE invoices SET purchase_order_id = ?, updated_at = ? WHERE id = ?').run(
+      await db.prepare('UPDATE invoices SET purchase_order_id = ?, updated_at = ? WHERE id = ?').run(
         poMatch.matchedPoId,
         isoNow(),
         invoiceRow.id
       );
     }
 
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 6,
       status: poMatch.matchStatus === 'EXACT' && poMatch.poStatus !== 'CLOSED' ? 'COMPLETED' : 'WARNING',
@@ -491,9 +494,9 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 7: TOLERANCE VERIFICATION ====================
     currentStage = 7;
-    db.prepare(`UPDATE processing_runs SET current_stage = 7 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 7 WHERE id = ?`).run(runId);
     const s7Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 7,
       status: 'STARTED',
@@ -501,7 +504,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     });
 
     const tolerance = runStage7ToleranceVerification(poMatch, extracted, settings);
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 7,
       status: tolerance.evaluated && tolerance.withinTolerance && tolerance.currencyMatch ? 'COMPLETED' : 'WARNING',
@@ -518,9 +521,9 @@ export async function executeProcessingRun(runId: string): Promise<void> {
 
     // ==================== STAGE 8: DECISION GENERATION (ATOMIC) ====================
     currentStage = 8;
-    db.prepare(`UPDATE processing_runs SET current_stage = 8 WHERE id = ?`).run(runId);
+    await db.prepare(`UPDATE processing_runs SET current_stage = 8 WHERE id = ?`).run(runId);
     const s8Start = Date.now();
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId,
       stageNumber: 8,
       status: 'STARTED',
@@ -589,8 +592,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
     const totalDurationMs = Date.now() - runStartMs;
     const reviewStatus = decisionResult.outcome === 'REVIEW' ? 'PENDING_REVIEW' : 'NOT_REQUIRED';
 
-    db.exec('BEGIN IMMEDIATE;');
-    try {
+    const { finalOutcome, finalReasonCode, finalExplanation, finalReviewStatus, finalTriggered } = await db.transaction(async () => {
       // Re-verify PO balance under exclusive write lock if auto-approving
       let finalOutcome = decisionResult.outcome;
       let finalReasonCode = decisionResult.primaryReasonCode;
@@ -598,7 +600,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
       let finalReviewStatus = reviewStatus;
       let finalTriggered = decisionResult.triggeredRules;
 
-      const latestInv = db
+      const latestInv = await db
         .prepare('SELECT po_consumed_applied FROM invoices WHERE id = ?')
         .get(invoiceRow.id) as { po_consumed_applied: number } | undefined;
 
@@ -611,7 +613,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         latestInv &&
         latestInv.po_consumed_applied === 0
       ) {
-        const lockedPo = db
+        const lockedPo = await db
           .prepare('SELECT id, original_amount, consumed_amount, status FROM purchase_orders WHERE id = ?')
           .get(poMatch.matchedPoId) as
           | {
@@ -665,10 +667,10 @@ export async function executeProcessingRun(runId: string): Promise<void> {
           } else {
             const newConsumed = consumed.plus(totalDec);
             const newStatus = newConsumed.gte(orig) ? 'FULLY_CONSUMED' : 'PARTIALLY_CONSUMED';
-            db.prepare(
+            await db.prepare(
               `UPDATE purchase_orders SET consumed_amount = ?, status = ?, updated_at = ? WHERE id = ?`
             ).run(newConsumed.toFixed(4), newStatus, completedAt, lockedPo.id);
-            db.prepare(`UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?`).run(invoiceRow.id);
+            await db.prepare(`UPDATE invoices SET po_consumed_applied = 1 WHERE id = ?`).run(invoiceRow.id);
           }
         }
       }
@@ -708,7 +710,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         ...(aiReviewerBrief && !explanationChangedUnderLock ? { ai_reviewer_brief: aiReviewerBrief } : {}),
       };
 
-      db.prepare(
+      await db.prepare(
         `INSERT INTO decisions (
            id, run_id, invoice_id, outcome, primary_reason_code, triggered_rules, explanation, evidence_snapshot,
            explanation_source, explanation_provider, explanation_model, explanation_prompt_version,
@@ -738,7 +740,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         completedAt
       );
 
-      db.prepare(
+      await db.prepare(
         `UPDATE invoices SET
           processing_status = 'COMPLETED',
           business_decision = ?,
@@ -749,7 +751,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
          WHERE id = ?`
       ).run(finalOutcome, finalReviewStatus, runId, decisionId, completedAt, invoiceRow.id);
 
-      db.prepare(
+      await db.prepare(
         `UPDATE processing_runs SET
           status = 'COMPLETED',
           current_stage = 8,
@@ -758,7 +760,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
          WHERE id = ?`
       ).run(completedAt, totalDurationMs, runId);
 
-      writeAuditLog({
+      await writeAuditLog({
         actorId: null,
         actorType: 'SYSTEM',
         actorRole: 'ENGINE',
@@ -777,77 +779,74 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         },
       });
 
-      db.exec('COMMIT;');
+      return { finalOutcome, finalReasonCode, finalExplanation, finalReviewStatus, finalTriggered };
+    });
 
-      if (finalReviewStatus === 'PENDING_REVIEW') {
-        const displayRef = extracted.invoice_number || invoiceRow.original_filename;
-        const vendorLabel = vendorResult.canonicalName || extracted.vendor.name;
-        const amtLabel =
-          extracted.total_amount && extracted.currency
-            ? ` · ${extracted.currency} ${extracted.total_amount}`
-            : '';
-        createWorkspaceNotification({
-          eventType: 'MANUAL_REVIEW_REQUIRED',
-          severity: 'WARNING',
-          title: 'Manual Review Required',
-          message: `${displayRef}${vendorLabel ? ` (${vendorLabel})` : ''}${amtLabel} routed for human review (${finalReasonCode}).`,
-          invoiceId: invoiceRow.id,
-          runId,
-          metadata: {
-            primary_reason_code: finalReasonCode,
-            business_decision: finalOutcome,
-            vendor_name: vendorLabel,
-            total_amount: extracted.total_amount,
-            currency: extracted.currency,
-          },
-        });
-      }
-
-      const finalEventId = persistAndEmitStageEvent({
+    if (finalReviewStatus === 'PENDING_REVIEW') {
+      const displayRef = extracted.invoice_number || invoiceRow.original_filename;
+      const vendorLabel = vendorResult.canonicalName || extracted.vendor.name;
+      const amtLabel =
+        extracted.total_amount && extracted.currency
+          ? ` · ${extracted.currency} ${extracted.total_amount}`
+          : '';
+      await createWorkspaceNotification({
+        eventType: 'MANUAL_REVIEW_REQUIRED',
+        severity: 'WARNING',
+        title: 'Manual Review Required',
+        message: `${displayRef}${vendorLabel ? ` (${vendorLabel})` : ''}${amtLabel} routed for human review (${finalReasonCode}).`,
+        invoiceId: invoiceRow.id,
         runId,
-        stageNumber: 8,
-        status: 'COMPLETED',
-        durationMs: Date.now() - s8Start,
-        summary: `Final Decision: ${finalOutcome} (${finalReasonCode})`,
-        evidence: {
-          outcome: finalOutcome,
+        metadata: {
           primary_reason_code: finalReasonCode,
-          triggered_rules: finalTriggered,
-        },
-      });
-
-      sseBroker.publish(runId, {
-        id: finalEventId,
-        event: 'run_completed',
-        data: {
-          run_id: runId,
-          invoice_id: invoiceRow.id,
-          processing_status: 'COMPLETED',
           business_decision: finalOutcome,
-          review_status: finalReviewStatus,
-          primary_reason_code: finalReasonCode,
-          duration_ms: totalDurationMs,
+          vendor_name: vendorLabel,
+          total_amount: extracted.total_amount,
+          currency: extracted.currency,
         },
       });
-    } catch (txErr) {
-      safeRollback(db);
-      throw txErr;
     }
+
+    const finalEventId = await persistAndEmitStageEvent({
+      runId,
+      stageNumber: 8,
+      status: 'COMPLETED',
+      durationMs: Date.now() - s8Start,
+      summary: `Final Decision: ${finalOutcome} (${finalReasonCode})`,
+      evidence: {
+        outcome: finalOutcome,
+        primary_reason_code: finalReasonCode,
+        triggered_rules: finalTriggered,
+      },
+    });
+
+    sseBroker.publish(runId, {
+      id: finalEventId,
+      event: 'run_completed',
+      data: {
+        run_id: runId,
+        invoice_id: invoiceRow.id,
+        processing_status: 'COMPLETED',
+        business_decision: finalOutcome,
+        review_status: finalReviewStatus,
+        primary_reason_code: finalReasonCode,
+        duration_ms: totalDurationMs,
+      },
+    });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     const failedAt = isoNow();
     const durationMs = Date.now() - runStartMs;
 
     try {
-      db.prepare(
+      await db.prepare(
         `UPDATE processing_runs SET status = 'FAILED', error_stage = ?, error_message = ?, completed_at = ?, duration_ms = ? WHERE id = ?`
       ).run(currentStage, errMsg, failedAt, durationMs, runId);
 
-      db.prepare(
+      await db.prepare(
         `UPDATE invoices SET processing_status = 'FAILED', latest_run_id = ?, updated_at = ? WHERE id = ?`
       ).run(runId, failedAt, invoiceRow.id);
 
-      const failEventId = persistAndEmitStageEvent({
+      const failEventId = await persistAndEmitStageEvent({
         runId,
         stageNumber: currentStage,
         status: 'FAILED',
@@ -856,7 +855,7 @@ export async function executeProcessingRun(runId: string): Promise<void> {
         evidence: { error_stage: currentStage, error_message: errMsg },
       });
 
-      createWorkspaceNotification({
+      await createWorkspaceNotification({
         eventType: 'PIPELINE_FAILED',
         severity: 'CRITICAL',
         title: `Pipeline Failed (Stage ${currentStage})`,
@@ -883,23 +882,31 @@ export async function executeProcessingRun(runId: string): Promise<void> {
   }
 }
 
-export function recoverStaleRuns(): void {
+export async function recoverStaleRuns(): Promise<void> {
   const db = getDb();
   const now = isoNow();
-  const stale = db
-    .prepare("SELECT id, invoice_id, current_stage FROM processing_runs WHERE status = 'RUNNING'")
-    .all() as Array<{ id: string; invoice_id: string; current_stage: number }>;
+  // With a shared database another instance may be processing a run right now, so only
+  // recover runs that have been RUNNING far longer than any function can live.
+  // With a local single-process database every RUNNING run at boot is orphaned.
+  const cutoff = config.usesSharedDatabase
+    ? new Date(Date.now() - 15 * 60_000).toISOString()
+    : '9999-12-31T00:00:00.000Z';
+  const stale = await db
+    .prepare(
+      "SELECT id, invoice_id, current_stage FROM processing_runs WHERE status = 'RUNNING' AND (started_at IS NULL OR started_at < ?)"
+    )
+    .all(cutoff) as Array<{ id: string; invoice_id: string; current_stage: number }>;
 
   for (const r of stale) {
     const stage = r.current_stage || 2;
     const msg = 'Processing interrupted by server restart. Click Retry to re-run.';
-    db.prepare(
+    await db.prepare(
       `UPDATE processing_runs SET status = 'FAILED', error_stage = ?, error_message = ?, completed_at = ? WHERE id = ?`
     ).run(stage, msg, now, r.id);
-    db.prepare(
+    await db.prepare(
       `UPDATE invoices SET processing_status = 'FAILED', updated_at = ? WHERE id = ? AND latest_run_id = ?`
     ).run(now, r.invoice_id, r.id);
-    persistAndEmitStageEvent({
+    await persistAndEmitStageEvent({
       runId: r.id,
       stageNumber: stage,
       status: 'FAILED',

@@ -48,9 +48,9 @@ class WorkspaceNotificationBroker extends EventEmitter {
 export const notificationBroker = new WorkspaceNotificationBroker();
 notificationBroker.setMaxListeners(100);
 
-function getEnabledEventTypes(): NotificationEventType[] {
+async function getEnabledEventTypes(): Promise<NotificationEventType[]> {
   const db = getDb();
-  const settings = db
+  const settings = await db
     .prepare('SELECT notify_on_upload, notify_on_review, notify_on_failure FROM application_settings WHERE id = 1')
     .get() as { notify_on_upload?: number; notify_on_review?: number; notify_on_failure?: number } | undefined;
 
@@ -93,9 +93,9 @@ function hydrateNotificationRow(row: any): WorkspaceNotificationItem {
   };
 }
 
-export function getNotificationById(notificationId: number, userId?: string): WorkspaceNotificationItem | null {
+export async function getNotificationById(notificationId: number, userId?: string): Promise<WorkspaceNotificationItem | null> {
   const db = getDb();
-  const row = db
+  const row = await db
     .prepare(
       `SELECT n.*, nr.read_at,
               i.invoice_number, i.original_filename, i.processing_status, i.business_decision, i.review_status,
@@ -113,7 +113,7 @@ export function getNotificationById(notificationId: number, userId?: string): Wo
   return row ? hydrateNotificationRow(row) : null;
 }
 
-export function createWorkspaceNotification(params: {
+export async function createWorkspaceNotification(params: {
   eventType: NotificationEventType;
   severity?: NotificationSeverity;
   title: string;
@@ -123,9 +123,9 @@ export function createWorkspaceNotification(params: {
   actorId?: string | null;
   metadata?: Record<string, unknown>;
   bypassSettingsCheck?: boolean;
-}): WorkspaceNotificationItem | null {
+}): Promise<WorkspaceNotificationItem | null> {
   if (!params.bypassSettingsCheck) {
-    const enabled = getEnabledEventTypes();
+    const enabled = await getEnabledEventTypes();
     if (!enabled.includes(params.eventType)) {
       return null;
     }
@@ -141,7 +141,7 @@ export function createWorkspaceNotification(params: {
         ? 'WARNING'
         : 'INFO');
 
-  const res = db
+  const res = await db
     .prepare(
       `INSERT INTO notifications (event_type, severity, title, message, invoice_id, run_id, actor_id, metadata_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -159,7 +159,7 @@ export function createWorkspaceNotification(params: {
     );
 
   const id = Number(res.lastInsertRowid);
-  const item = getNotificationById(id);
+  const item = await getNotificationById(id);
   if (item) {
     notificationBroker.publish({
       id,
@@ -170,18 +170,18 @@ export function createWorkspaceNotification(params: {
   return item;
 }
 
-export function listNotificationsForUser(
+export async function listNotificationsForUser(
   userId: string,
   opts: { type?: string; unreadOnly?: boolean; limit?: number } = {}
-): {
+): Promise<{
   items: WorkspaceNotificationItem[];
   unread_count: number;
   pending_review_count: number;
   failed_count: number;
   enabled_types: NotificationEventType[];
-} {
+}> {
   const db = getDb();
-  const enabledTypes = getEnabledEventTypes();
+  const enabledTypes = await getEnabledEventTypes();
   const placeholders = enabledTypes.map(() => '?').join(',');
   const rawLimit = Number(opts.limit);
   const limit = Number.isFinite(rawLimit) ? Math.min(100, Math.max(1, Math.trunc(rawLimit))) : 30;
@@ -197,7 +197,7 @@ export function listNotificationsForUser(
     whereClauses.push('nr.read_at IS NULL');
   }
 
-  const rows = db
+  const rows = await db
     .prepare(
       `SELECT n.*, nr.read_at,
               i.invoice_number, i.original_filename, i.processing_status, i.business_decision, i.review_status,
@@ -214,7 +214,7 @@ export function listNotificationsForUser(
     )
     .all(...params, limit) as any[];
 
-  const unreadRow = db
+  const unreadRow = await db
     .prepare(
       `SELECT COUNT(*) AS c
        FROM notifications n
@@ -223,11 +223,11 @@ export function listNotificationsForUser(
     )
     .get(userId, ...enabledTypes) as { c: number };
 
-  const pendingRow = db
+  const pendingRow = await db
     .prepare("SELECT COUNT(*) AS c FROM invoices WHERE review_status = 'PENDING_REVIEW'")
     .get() as { c: number };
 
-  const failedRow = db
+  const failedRow = await db
     .prepare("SELECT COUNT(*) AS c FROM invoices WHERE processing_status = 'FAILED'")
     .get() as { c: number };
 
@@ -240,11 +240,11 @@ export function listNotificationsForUser(
   };
 }
 
-export function listMissedNotificationsSince(lastEventId: number): WorkspaceNotificationItem[] {
+export async function listMissedNotificationsSince(lastEventId: number): Promise<WorkspaceNotificationItem[]> {
   const db = getDb();
-  const enabledTypes = getEnabledEventTypes();
+  const enabledTypes = await getEnabledEventTypes();
   const placeholders = enabledTypes.map(() => '?').join(',');
-  const rows = db
+  const rows = await db
     .prepare(
       `SELECT n.*, NULL AS read_at,
               i.invoice_number, i.original_filename, i.processing_status, i.business_decision, i.review_status,
@@ -263,10 +263,10 @@ export function listMissedNotificationsSince(lastEventId: number): WorkspaceNoti
   return rows.map(hydrateNotificationRow);
 }
 
-export function markNotificationRead(userId: string, notificationId: number): void {
+export async function markNotificationRead(userId: string, notificationId: number): Promise<void> {
   const db = getDb();
   const now = isoNow();
-  db.prepare(
+  await db.prepare(
     `INSERT OR IGNORE INTO notification_reads (notification_id, user_id, read_at)
      VALUES (?, ?, ?)`
   ).run(notificationId, userId, now);
@@ -278,10 +278,10 @@ export function markNotificationRead(userId: string, notificationId: number): vo
   });
 }
 
-export function markAllNotificationsRead(userId: string): number {
+export async function markAllNotificationsRead(userId: string): Promise<number> {
   const db = getDb();
   const now = isoNow();
-  const unread = db
+  const unread = await db
     .prepare(
       `SELECT n.id
        FROM notifications n
@@ -293,9 +293,9 @@ export function markAllNotificationsRead(userId: string): number {
   const stmt = db.prepare(
     `INSERT OR IGNORE INTO notification_reads (notification_id, user_id, read_at) VALUES (?, ?, ?)`
   );
-  withTransaction(db, () => {
+  await withTransaction(db, async () => {
     for (const row of unread) {
-      stmt.run(row.id, userId, now);
+      await stmt.run(row.id, userId, now);
     }
   });
 

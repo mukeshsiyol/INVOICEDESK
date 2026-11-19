@@ -1,4 +1,4 @@
-import type { DatabaseSync } from 'node:sqlite';
+import type { AsyncDatabase } from './db.ts';
 import Decimal from 'decimal.js';
 import type { ExtractedInvoicePayload } from './extraction.ts';
 
@@ -263,14 +263,14 @@ export function runStage3Validation(
   };
 }
 
-export function runStage4VendorVerification(
-  db: DatabaseSync,
+export async function runStage4VendorVerification(
+  db: AsyncDatabase,
   extracted: ExtractedInvoicePayload
-): VendorVerificationResult {
+): Promise<VendorVerificationResult> {
   const rawName = extracted.vendor.name?.trim() || null;
   const rawTaxId = extracted.vendor.tax_id?.trim() || null;
 
-  const vendors = db
+  const vendors = await db
     .prepare(
       'SELECT id, vendor_code, canonical_name, normalized_name, aliases, tax_id, verification_status FROM vendors'
     )
@@ -429,15 +429,15 @@ function vendorsShareIdentity(
   return diceSimilarity(normCurr, normCand) >= 0.85;
 }
 
-export function runStage5DuplicateDetection(
-  db: DatabaseSync,
+export async function runStage5DuplicateDetection(
+  db: AsyncDatabase,
   invoiceId: string,
   fileSha256: string,
   vendorResult: VendorVerificationResult,
   extracted: ExtractedInvoicePayload
-): DuplicateCheckResult {
+): Promise<DuplicateCheckResult> {
   // 1. Exact binary SHA-256 check against prior non-failed invoices
-  const fileMatch = db
+  const fileMatch = await db
     .prepare(
       `SELECT id, invoice_number, original_filename, extracted_vendor_name, invoice_date, created_at
        FROM invoices
@@ -477,7 +477,7 @@ export function runStage5DuplicateDetection(
 
   // 2. Semantic business-key check: (vendor [linked or normalized name], normalized_invoice_number)
   if (normInvNo && (vendorResult.matchedVendorId || normalizeVendorName(extracted.vendor.name))) {
-    const bizCandidates = db
+    const bizCandidates = await db
       .prepare(
         `SELECT id, vendor_id, extracted_vendor_name, invoice_number, invoice_date, total_amount, original_filename, created_at
          FROM invoices
@@ -544,7 +544,7 @@ export function runStage5DuplicateDetection(
     !Number.isNaN(currDateMs) &&
     (vendorResult.matchedVendorId || normalizeVendorName(extracted.vendor.name))
   ) {
-    const candidates = db
+    const candidates = await db
       .prepare(
         `SELECT id, vendor_id, extracted_vendor_name, invoice_number, normalized_invoice_number, original_filename, total_amount, invoice_date, created_at
          FROM invoices
@@ -629,15 +629,15 @@ export function runStage5DuplicateDetection(
   };
 }
 
-export function runStage6PoMatching(
-  db: DatabaseSync,
+export async function runStage6PoMatching(
+  db: AsyncDatabase,
   extracted: ExtractedInvoicePayload,
   vendorResult: VendorVerificationResult
-): PoMatchResult {
+): Promise<PoMatchResult> {
   const normPo = normalizeDocNumber(extracted.po_number);
 
-  const fetchPriorInvoices = (poId: string) =>
-    db
+  const fetchPriorInvoices = async (poId: string) =>
+    await db
       .prepare(
         `SELECT id, invoice_number, total_amount, created_at
          FROM invoices
@@ -647,7 +647,7 @@ export function runStage6PoMatching(
       .all(poId) as Array<{ id: string; invoice_number: string | null; total_amount: string; created_at: string }>;
 
   if (normPo) {
-    const po = db
+    const po = await db
       .prepare(
         `SELECT id, po_number, vendor_id, currency, original_amount, consumed_amount, status
          FROM purchase_orders WHERE normalized_po_number = ?`
@@ -690,7 +690,7 @@ export function runStage6PoMatching(
         priorConsumedAmount: po.consumed_amount,
         poVendorId: po.vendor_id,
         candidatePos: [],
-        priorApprovedInvoices: fetchPriorInvoices(po.id),
+        priorApprovedInvoices: await fetchPriorInvoices(po.id),
       };
     }
 
@@ -704,13 +704,13 @@ export function runStage6PoMatching(
       priorConsumedAmount: po.consumed_amount,
       poVendorId: po.vendor_id,
       candidatePos: [],
-      priorApprovedInvoices: fetchPriorInvoices(po.id),
+      priorApprovedInvoices: await fetchPriorInvoices(po.id),
     };
   }
 
   // No explicit PO number extracted -> inspect open POs for matched vendor as implied candidates
   if (vendorResult.matchedVendorId) {
-    const openPos = db
+    const openPos = await db
       .prepare(
         `SELECT id, po_number, currency, original_amount, consumed_amount, status
          FROM purchase_orders

@@ -18,6 +18,17 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(FIXTURES_DIR, { recursive: true });
 
+const tursoUrl = (process.env.TURSO_DATABASE_URL || process.env.DATABASE_URL || '').trim();
+const databaseUrl = tursoUrl || `file:${path.join(DATA_DIR, 'invoicedesk.db')}`;
+const usesSharedDatabase = !databaseUrl.startsWith('file:');
+
+if (isServerless && !usesSharedDatabase) {
+  console.warn(
+    '[invoicedesk] Running serverless without TURSO_DATABASE_URL. Data lives in this instance\'s /tmp and ' +
+      'will NOT be visible to other instances (uploads will appear to vanish). Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN.'
+  );
+}
+
 const pauseAuthForDemo =
   (process.env.PAUSE_AUTH_FOR_DEMO ?? 'true').toLowerCase() === 'true';
 const explicitRoleSwitcher = process.env.ENABLE_DEMO_ROLE_SWITCHER?.trim().toLowerCase();
@@ -44,7 +55,9 @@ export const config = {
   sessionCookieName: 'invoicedesk_session',
   signedOutCookieName: 'invoicedesk_signed_out',
   dataDir: DATA_DIR,
-  dbPath: path.join(DATA_DIR, 'invoicedesk.db'),
+  databaseUrl,
+  databaseAuthToken: (process.env.TURSO_AUTH_TOKEN || process.env.DATABASE_AUTH_TOKEN || '').trim(),
+  usesSharedDatabase,
   storageDir: STORAGE_DIR,
   fixturesDir: FIXTURES_DIR,
   maxUploadBytes: 25 * 1024 * 1024,
